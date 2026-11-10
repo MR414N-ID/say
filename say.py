@@ -1728,8 +1728,23 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("👑 *Panel Admin:*", parse_mode="Markdown", reply_markup=kb_admin())
         else:
             await update.message.reply_text(
-                "👋 *SPY + OSINT BOT*\n\nKetik /start untuk membuka panel.",
-                parse_mode="Markdown")
+                "👋 WELCOME TO SPY BOT BY LANOX\n\n"
+                "🕵️ Selamat datang di SPY BOT, platform pemantauan dan pelacakan digital.\n\n"
+                "📡 FITUR BOT:\n"
+                "📷 Monitoring Kamera\n"
+                "📍 Pelacakan Lokasi\n"
+                "🔗 Sistem Berbasis Link\n\n"
+                "🔐 AKSES MEMBER\n"
+                "Bot ini hanya dapat digunakan oleh member yang telah terdaftar.\n\n"
+                "🎁 FREE ACCESS\n"
+                "• Limit penggunaan: 3 Link\n"
+                "• Upgrade Premium untuk mendapatkan limit lebih besar.\n\n"
+                "🚀 MULAI SEKARANG\n"
+                "👉 Ketik /start untuk memulai.\n\n"
+                "⚠️ Gunakan seluruh fitur hanya pada perangkat dan lokasi yang Anda miliki atau dengan persetujuan pemiliknya.\n\n"
+                "🔥 SPY BOT BY LANOX\n"
+                "Smart Monitoring • Digital Tracking"
+            )
         return
 
     # ============================================================
