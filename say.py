@@ -1140,7 +1140,7 @@ def kb_reply(uid):
     ]
     if role == "admin":
         rows.append([KeyboardButton("👑 Panel Admin")])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True, persistent=True)
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
 def kb_main(uid):
     role = db_get_role(uid)
