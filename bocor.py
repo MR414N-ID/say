@@ -131,16 +131,17 @@ def leakcheck_check(query, api_key=None):
         if r.status_code == 200:
             data = r.json()
             if data.get("success"):
-                sources = data.get("sources", [])
                 out = []
                 for item in data.get("result", []):
+                    src_obj = item.get("source", {})
+                    src_name = src_obj.get("name", "Unknown") if isinstance(src_obj, dict) else str(src_obj)
+                    
+                    fields_data = {k: v for k, v in item.items() if k not in ("source", "fields")}
+                    
                     out.append({
-                        "source": item.get("source", "unknown"),
-                        "fields": {k: v for k, v in item.items() if k != "source"},
+                        "source": src_name,
+                        "fields": fields_data
                     })
-                for s in sources:
-                    if not any(o["source"] == s.get("name") for o in out):
-                        out.append({"source": s.get("name", "unknown"), "fields": {}})
                 return out
             return []
         if r.status_code == 404:
@@ -272,6 +273,7 @@ def merge_all_records(xon_names, ll_records, lc_records):
         if key not in seen:
             seen.add(key)
             out.append({"source": n, "fields": {}, "from": "XON"})
+            
     for rec in (ll_records or []):
         if not isinstance(rec, dict):
             continue
@@ -282,6 +284,7 @@ def merge_all_records(xon_names, ll_records, lc_records):
         if key not in seen:
             seen.add(key)
             out.append({"source": src, "fields": fields, "from": "LeakLookup"})
+            
     for rec in (lc_records or []):
         if not isinstance(rec, dict):
             continue
@@ -292,6 +295,7 @@ def merge_all_records(xon_names, ll_records, lc_records):
         if key not in seen:
             seen.add(key)
             out.append({"source": src, "fields": fields, "from": "LeakCheck"})
+            
     return out
 
 def extract_passwords(records):
@@ -323,7 +327,7 @@ def print_banner():
     for i, line in enumerate(lines):
         art.append(line + "\n", style=f"bold {COLORS[i % len(COLORS)]}")
     console.print(Align.center(art))
-    console.print(Align.center(Text("[ MR414N-ID | Data Breach Checker | v2.1 ]", style="bold cyan")))
+    console.print(Align.center(Text("[ MR414N-ID | Data Breach Checker | v2.2 ]", style="bold cyan")))
     console.print()
 
 def display_records(term, records):
