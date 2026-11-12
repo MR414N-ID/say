@@ -30,9 +30,6 @@ except ImportError:
     RICH_OK = False
     console = None
 
-# ================================================================== #
-#  ASCII / COLORS
-# ================================================================== #
 ASCII_ART = """
 ███╗   ███╗██████╗ ██╗  ██╗ ██╗ ██╗  ███╗  ███╗       ██╗██████╗ 
 ████╗ ████║██╔══██╗██║  ██║ ██║ ██║ ██╔██╗ ██╔██╗      ██║██╔══██╗
@@ -42,12 +39,8 @@ ASCII_ART = """
 ╚═╝     ╚═╝╚═╝  ╚═╝      ╚═╝      ╚═╝  ╚═╝    ╚═╝     ╚═╝╚═════╝ 
 """
 COLORS = ["red", "yellow", "green", "cyan", "blue", "magenta"]
-
 UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/124.0 Mobile Safari/537.36"
 
-# ================================================================== #
-#  HIBP META CACHE
-# ================================================================== #
 _hibp_cache: dict = {}
 
 def load_hibp_metadata():
@@ -63,12 +56,9 @@ def load_hibp_metadata():
     except Exception:
         pass
 
-def get_hibp_meta(name: str) -> dict:
+def get_hibp_meta(name):
     return _hibp_cache.get((name or "").lower(), {})
 
-# ================================================================== #
-#  SEVERITY
-# ================================================================== #
 SENSITIVE_FIELDS = {
     "passwords", "password", "credit cards", "bank account numbers",
     "phone numbers", "physical addresses", "dates of birth",
@@ -107,27 +97,58 @@ def leaklookup_check(query, search_type, key):
         r = requests.post(
             "https://leak-lookup.com/api/search",
             data={"key": key, "type": search_type, "query": query},
-            timeout=15)
+            timeout=20)
         if r.status_code == 200:
             data = r.json()
             if str(data.get("error")).lower() == "false":
                 msg = data.get("message", {})
-                return list(msg.keys()) if isinstance(msg, dict) else []
+                if isinstance(msg, dict):
+                    out = []
+                    for src, items in msg.items():
+                        if isinstance(items, list) and items:
+                            for item in items:
+                                out.append({
+                                    "source": src,
+                                    "fields": item if isinstance(item, dict) else {},
+                                })
+                        else:
+                            out.append({"source": src, "fields": {}})
+                    return out
+                return []
             return []
     except Exception:
         pass
     return None
 
-def leakcheck_check(query):
+def leakcheck_check(query, api_key=None):
+    if not api_key:
+        return None
     try:
         r = requests.get(
-            f"https://leakcheck.io/api/public?check={query}",
-            headers={"User-Agent": UA}, timeout=10)
+            "https://leakcheck.io/api/v2/query/" + query,
+            headers={"X-API-Key": api_key, "User-Agent": UA},
+            timeout=25)
         if r.status_code == 200:
             data = r.json()
             if data.get("success"):
-                return [s.get("name", "unknown") for s in data.get("sources", [])]
+                sources = data.get("sources", [])
+                out = []
+                for item in data.get("result", []):
+                    out.append({
+                        "source": item.get("source", "unknown"),
+                        "fields": {k: v for k, v in item.items() if k != "source"},
+                    })
+                for s in sources:
+                    if not any(o["source"] == s.get("name") for o in out):
+                        out.append({"source": s.get("name", "unknown"), "fields": {}})
+                return out
             return []
+        if r.status_code == 404:
+            return []
+        if r.status_code == 401:
+            return [{"source": "ERROR_AUTH", "fields": {"message": "API key invalid"}}]
+        if r.status_code == 429:
+            return [{"source": "ERROR_QUOTA", "fields": {"message": "Quota habis"}}]
     except Exception:
         pass
     return None
@@ -154,8 +175,7 @@ def abstract_phone_check(phone, api_key):
     try:
         r = requests.get(
             "https://phoneintelligence.abstractapi.com/v1/",
-            params={"api_key": api_key, "phone": phone},
-            timeout=15)
+            params={"api_key": api_key, "phone": phone}, timeout=15)
         if r.status_code == 200:
             return r.json()
     except Exception:
@@ -242,121 +262,157 @@ def parse_nik(nik):
     }
 
 # ================================================================== #
-#  CLI HELPERS
+#  MERGE / EXTRACT
+# ================================================================== #
+def merge_all_records(xon_names, ll_records, lc_records):
+    seen = set()
+    out = []
+    for n in (xon_names or []):
+        key = ("xon", str(n).lower(), "")
+        if key not in seen:
+            seen.add(key)
+            out.append({"source": n, "fields": {}, "from": "XON"})
+    for rec in (ll_records or []):
+        if not isinstance(rec, dict):
+            continue
+        src = rec.get("source", "unknown")
+        fields = rec.get("fields", {}) or {}
+        pwd = fields.get("password", "") if isinstance(fields, dict) else ""
+        key = ("ll", str(src).lower(), str(pwd))
+        if key not in seen:
+            seen.add(key)
+            out.append({"source": src, "fields": fields, "from": "LeakLookup"})
+    for rec in (lc_records or []):
+        if not isinstance(rec, dict):
+            continue
+        src = rec.get("source", "unknown")
+        fields = rec.get("fields", {}) or {}
+        pwd = fields.get("password", "") if isinstance(fields, dict) else ""
+        key = ("lc", str(src).lower(), str(pwd))
+        if key not in seen:
+            seen.add(key)
+            out.append({"source": src, "fields": fields, "from": "LeakCheck"})
+    return out
+
+def extract_passwords(records):
+    pwds = []
+    seen = set()
+    for r in records:
+        f = r.get("fields", {}) or {}
+        pwd = f.get("password") or f.get("pass") or f.get("passwd")
+        if pwd and str(pwd) not in seen:
+            seen.add(str(pwd))
+            pwds.append({
+                "password": str(pwd),
+                "source": r.get("source", "?"),
+                "from": r.get("from", "?"),
+                "email": f.get("email") or f.get("mail") or "",
+                "username": f.get("username") or f.get("login") or "",
+            })
+    return pwds
+
+# ================================================================== #
+#  CLI
 # ================================================================== #
 def print_banner():
     if not RICH_OK:
-        print(ASCII_ART)
-        return
+        print(ASCII_ART); return
     console.clear()
     lines = ASCII_ART.strip().split("\n")
     art = Text()
     for i, line in enumerate(lines):
         art.append(line + "\n", style=f"bold {COLORS[i % len(COLORS)]}")
     console.print(Align.center(art))
-    console.print(Align.center(Text("[ MR414N-ID | Data Breach Checker | v2.0 ]", style="bold cyan")))
+    console.print(Align.center(Text("[ MR414N-ID | Data Breach Checker | v2.1 ]", style="bold cyan")))
     console.print()
 
-def merge_breach_names(*lists):
-    seen = set(); merged = []
-    for lst in lists:
-        for name in (lst or []):
-            k = name.lower()
-            if k not in seen:
-                seen.add(k); merged.append(name)
-    return merged
-
-def display_email_results(email, breach_names):
+def display_records(term, records):
     if not RICH_OK:
-        if not breach_names:
-            print(f"✅ {email} — tidak ditemukan breach")
-            return
-        print(f"⚠️ {email} — {len(breach_names)} breach")
-        for n in breach_names:
-            print(f"  - {n}")
+        print(f"{term}: {len(records)} record")
+        for r in records:
+            f = r.get("fields", {})
+            print(f"  [{r['from']}] {r['source']} | pass={f.get('password','-')}")
         return
     console.print()
-    if not breach_names:
+    if not records:
         console.print(Align.center(Panel(
             Align.center(Text("✅  Tidak ditemukan di breach manapun", style="bold green")),
             border_style="green", padding=(1, 4), width=60)))
         return
     summary = Text(justify="center")
-    summary.append(f"⚠️  {email}\n", style="bold white")
+    summary.append(f"⚠️  {term}\n", style="bold white")
     summary.append("ditemukan di ", style="white")
-    summary.append(f"{len(breach_names)} breach", style="bold red")
+    summary.append(f"{len(records)} record", style="bold red")
     console.print(Align.center(Panel(summary, border_style="red", padding=(1, 4), width=72)))
     table = Table(box=box.ROUNDED, border_style="bright_cyan", header_style="bold cyan",
                   show_lines=True, expand=True)
-    table.add_column("Breach", style="bold white", min_width=18)
-    table.add_column("Tahun", justify="center", min_width=6)
-    table.add_column("Akun", justify="right", min_width=10)
-    table.add_column("Data", min_width=28)
-    table.add_column("Severity", justify="center", min_width=10)
-    for name in breach_names:
-        meta = get_hibp_meta(name)
-        year = (meta.get("BreachDate") or "")[:4] or "—"
-        pc = meta.get("PwnCount", 0)
-        pwn = f"{pc/1_000_000:.1f}M" if pc >= 1_000_000 else (f"{pc/1_000:.0f}K" if pc >= 1_000 else str(pc))
-        dc = meta.get("DataClasses", [])
-        fields = ", ".join(dc[:5]) + (f" +{len(dc)-5}" if len(dc) > 5 else "") if dc else "tidak diketahui"
-        sev = severity(dc)
-        style = {"TINGGI":"bold red","SEDANG":"bold yellow","RENDAH":"bold green"}[sev]
-        table.add_row(name, year, pwn, fields, Text(sev, style=style))
+    table.add_column("Source", style="bold white", min_width=16)
+    table.add_column("Dari", justify="center", min_width=10)
+    table.add_column("Email/User", min_width=18)
+    table.add_column("Password", min_width=20)
+    table.add_column("Field Lain", min_width=20)
+    for r in records:
+        f = r.get("fields", {}) or {}
+        pw = f.get("password") or f.get("pass") or ""
+        email = f.get("email") or f.get("mail") or ""
+        user = f.get("username") or f.get("login") or ""
+        ident = email or user or "—"
+        others = ", ".join(k for k in f.keys() if k not in ("password","pass","email","mail","username","login"))
+        pw_style = "bold red" if pw else "dim white"
+        table.add_row(
+            r.get("source","?"), r.get("from","?"), ident,
+            Text(str(pw) if pw else "—", style=pw_style),
+            others or "—",
+        )
     console.print(table)
+    pw_list = extract_passwords(records)
+    if pw_list:
+        console.print()
+        console.print(Align.center(Text(f"🔑 {len(pw_list)} password unik ditemukan", style="bold yellow")))
 
-# ================================================================== #
-#  CLI MODE
-# ================================================================== #
 def cli_check_email(email, cfg):
-    print_banner() if not RICH_OK else None
     xon = xon_check_email(email)
     ll = leaklookup_check(email, "email_address", cfg.get("leaklookup"))
-    lc = leakcheck_check(email)
-    merged = merge_breach_names(xon, ll, lc)
-    display_email_results(email, merged)
+    lc = leakcheck_check(email, cfg.get("leakcheck_api"))
+    merged = merge_all_records(xon, ll, lc)
+    display_records(email, merged)
 
 def cli_check_username(username, cfg):
     xon = xon_check_email(username)
     ll = leaklookup_check(username, "username", cfg.get("leaklookup"))
-    lc = leakcheck_check(username)
-    merged = merge_breach_names(xon, ll, lc)
-    if RICH_OK:
-        if not merged:
-            console.print(Panel(Text(f"✅  Username '{username}' bersih", style="bold green"),
-                                border_style="green", padding=(1,4), width=60))
-        else:
-            console.print(Panel(Text(f"⚠️  '{username}' di {len(merged)} breach: {', '.join(merged)}",
-                                     style="bold red"), border_style="red", padding=(1,4), width=72))
-    else:
-        print(f"{username}: {len(merged)} breach")
+    lc = leakcheck_check(username, cfg.get("leakcheck_api"))
+    merged = merge_all_records(xon, ll, lc)
+    display_records(username, merged)
 
 def cli_check_phone(phone, cfg):
     normalized = format_phone_id(phone)
-    data = abstract_phone_check(normalized, cfg.get("abstractapi"))
-    if not data:
-        print("⚠️ AbstractAPI key kosong atau gagal.")
-        return
+    abs_data = abstract_phone_check(normalized, cfg.get("abstractapi"))
+    lc = leakcheck_check(normalized, cfg.get("leakcheck_api"))
+    merged = merge_all_records(None, None, lc)
     if RICH_OK:
-        t = Table(box=box.ROUNDED, border_style="bright_cyan", header_style="bold cyan", expand=True)
-        t.add_column("Field", style="bold white", min_width=22)
-        t.add_column("Info", min_width=36)
-        t.add_row("Nomor", f"+{normalized}")
-        t.add_row("Valid", "✅" if data.get("valid") else "❌")
-        carrier = data.get("carrier") or {}
-        country = data.get("country") or {}
-        t.add_row("Negara", country.get("name", "—") if isinstance(country, dict) else str(country))
-        t.add_row("Operator", carrier.get("name", "—") if isinstance(carrier, dict) else str(carrier))
-        t.add_row("Tipe", data.get("type", "—"))
-        br = data.get("phone_breaches") or {}
-        total = br.get("total_breaches", 0) if isinstance(br, dict) else 0
-        t.add_row("Total Breach", Text(str(total), style="bold red") if total else "✅ 0")
-        if total:
-            t.add_row("Pertama", br.get("date_first_breached", "—"))
-            t.add_row("Terakhir", br.get("date_last_breached", "—"))
-        console.print(t)
+        if abs_data:
+            t = Table(box=box.ROUNDED, border_style="bright_cyan", header_style="bold cyan", expand=True)
+            t.add_column("Field", style="bold white", min_width=22)
+            t.add_column("Info", min_width=36)
+            t.add_row("Nomor", f"+{normalized}")
+            t.add_row("Valid", "✅" if abs_data.get("valid") else "❌")
+            carrier = abs_data.get("carrier") or {}
+            country = abs_data.get("country") or {}
+            t.add_row("Negara", country.get("name", "—") if isinstance(country, dict) else str(country))
+            t.add_row("Operator", carrier.get("name", "—") if isinstance(carrier, dict) else str(carrier))
+            t.add_row("Tipe", abs_data.get("type", "—"))
+            br = abs_data.get("phone_breaches") or {}
+            total = br.get("total_breaches", 0) if isinstance(br, dict) else 0
+            t.add_row("Total Breach", Text(str(total), style="bold red") if total else "✅ 0")
+            console.print(t)
+        else:
+            console.print("[dim]AbstractAPI kosong / key belum diisi[/dim]")
+        if merged:
+            display_records(f"+{normalized}", merged)
+        else:
+            console.print("[green]✅ Tidak ada record LeakCheck untuk nomor ini[/green]")
     else:
-        print(f"+{normalized}: valid={data.get('valid')}")
+        print(f"+{normalized}: {len(merged)} record")
 
 def cli_check_password(password):
     cnt = hibp_password_check(password)
@@ -415,6 +471,7 @@ def main():
         print("[!] pip install rich"); return
     cfg = {
         "leaklookup": os.getenv("LEAKLOOKUP_KEY", ""),
+        "leakcheck_api": os.getenv("LEAKCHECK_API_KEY", ""),
         "abstractapi": os.getenv("ABSTRACTAPI_KEY", ""),
     }
     print_banner()
@@ -460,50 +517,73 @@ def _esc(s):
         s = s.replace(ch, "\\" + ch)
     return s
 
-def _fmt_breach_list(term, names):
-    if not names:
-        return f"✅ *Tidak ditemukan breach* untuk `{_esc(term)}`"
+def _fmt_records(term, records):
+    if not records:
+        return f"✅ *Tidak ditemukan* untuk `{_esc(term)}`"
     load_hibp_metadata()
-    out = [f"⚠️ *{_esc(term)}* — ditemukan di *{len(names)} breach*:\n"]
-    for name in names:
-        meta = get_hibp_meta(name)
-        year = (meta.get("BreachDate") or "")[:4] or "—"
-        dc = meta.get("DataClasses", [])
-        dc_str = ", ".join(dc[:4]) + (f" +{len(dc)-4}" if len(dc) > 4 else "") if dc else "tidak diketahui"
-        sev = severity(dc)
-        icon = {"TINGGI":"🔴","SEDANG":"🟡","RENDAH":"🟢"}[sev]
-        out.append(f"{icon} *{_esc(name)}* ({year})\n   `{_esc(dc_str)}`")
-    out.append("\n💡 Ganti password akun terdampak, aktifkan 2FA.")
+    head = [f"⚠️ *{_esc(term)}* — *{len(records)} record* ditemukan:\n"]
+    body = []
+    for r in records[:30]:
+        src = r.get("source", "?")
+        frm = r.get("from", "?")
+        f = r.get("fields", {}) or {}
+        pw = f.get("password") or f.get("pass") or ""
+        email = f.get("email") or f.get("mail") or ""
+        user = f.get("username") or f.get("login") or ""
+        ident = email or user or ""
+        line = f"🔸 *{_esc(src)}* _({frm})_"
+        if ident:
+            line += f"\n   👤 `{_esc(ident)}`"
+        if pw:
+            line += f"\n   🔑 `{_esc(pw)}`"
+        others = [k for k in f.keys() if k not in ("password","pass","email","mail","username","login")]
+        if others:
+            line += f"\n   📦 {_esc(', '.join(others[:5]))}"
+        body.append(line)
+    out = head + body
+    if len(records) > 30:
+        out.append(f"\n_...dan {len(records)-30} record lain_")
+    pw_list = extract_passwords(records)
+    if pw_list:
+        out.append(f"\n\n🔑 *{len(pw_list)} password unik ditemukan*")
     return "\n".join(out)
 
-def _fmt_phone(phone, data, has_key):
-    if not data:
-        if not has_key:
-            return "⚠️ `ABSTRACTAPI_KEY` belum diisi di `say.py`.\nIsi dulu untuk aktifkan cek breach nomor HP."
-        return "⚠️ Gagal terhubung ke AbstractAPI."
-    carrier = data.get("carrier") or {}
-    country = data.get("country") or {}
-    breaches = data.get("phone_breaches") or {}
-    risk = data.get("phone_risk") or {}
+def _fmt_phone_combined(phone, abs_data, records, has_key):
     out = [f"📱 *Phone Lookup* `+{_esc(phone)}`\n"]
-    out.append(f"Negara: {_esc(country.get('name') if isinstance(country, dict) else country)}")
-    out.append(f"Operator: {_esc(carrier.get('name') if isinstance(carrier, dict) else carrier)}")
-    out.append(f"Tipe: {_esc(data.get('type'))}")
-    out.append(f"Valid: {'✅' if data.get('valid') else '❌'}")
-    total = breaches.get("total_breaches", 0) if isinstance(breaches, dict) else 0
-    if total:
-        out.append(f"\n🔴 *Total breach:* {total}")
-        out.append(f"Pertama: {_esc(breaches.get('date_first_breached'))}")
-        out.append(f"Terakhir: {_esc(breaches.get('date_last_breached'))}")
-        doms = breaches.get("breached_domains", [])
-        if doms:
-            d_str = ", ".join((bd.get("domain", "?") if isinstance(bd, dict) else str(bd)) for bd in doms[:8])
-            out.append(f"Domain: {_esc(d_str)}")
+    if abs_data:
+        carrier = abs_data.get("carrier") or {}
+        country = abs_data.get("country") or {}
+        out.append(f"Negara: {_esc(country.get('name') if isinstance(country, dict) else country)}")
+        out.append(f"Operator: {_esc(carrier.get('name') if isinstance(carrier, dict) else carrier)}")
+        out.append(f"Valid: {'✅' if abs_data.get('valid') else '❌'}")
+        br = abs_data.get("phone_breaches") or {}
+        total = br.get("total_breaches", 0) if isinstance(br, dict) else 0
+        if total:
+            out.append(f"🔴 Total breach (Abstract): *{total}*")
+    elif not has_key:
+        out.append("_AbstractAPI key kosong — info jaringan di-skip_")
+
+    if records:
+        out.append(f"\n\n💧 *{len(records)} record dari LeakCheck:*")
+        for r in records[:15]:
+            f = r.get("fields", {}) or {}
+            pw = f.get("password") or f.get("pass") or ""
+            email = f.get("email") or f.get("mail") or ""
+            user = f.get("username") or f.get("login") or ""
+            ident = email or user or ""
+            line = f"🔸 *{_esc(r.get('source','?'))}*"
+            if ident:
+                line += f"\n   👤 `{_esc(ident)}`"
+            if pw:
+                line += f"\n   🔑 `{_esc(pw)}`"
+            out.append(line)
+        if len(records) > 15:
+            out.append(f"_...dan {len(records)-15} record lain_")
+        pw_list = extract_passwords(records)
+        if pw_list:
+            out.append(f"\n🔑 *{len(pw_list)} password unik ditemukan*")
     else:
-        out.append("\n✅ Tidak ada breach")
-    if isinstance(risk, dict) and risk:
-        if risk.get("is_abuse_detected"): out.append("⚠️ Spam/abuse terdeteksi")
-        if risk.get("is_disposable"): out.append("⚠️ Nomor disposable")
+        out.append("\n\n✅ Tidak ada record LeakCheck untuk nomor ini")
     return "\n".join(out)
 
 def _fmt_password(count):
@@ -511,9 +591,7 @@ def _fmt_password(count):
         return "⚠️ Gagal terhubung ke HIBP."
     if count == 0:
         return "✅ Password *tidak ditemukan* di breach manapun."
-    return (f"🔴 Password muncul *{count:,}x* di breach!\n"
-            f"Segera ganti password ini di semua akun.\n\n"
-            f"_Hanya 5 char pertama SHA1 yang dikirim — password tidak pernah utuh_")
+    return f"🔴 Password muncul *{count:,}x* di breach!\nSegera ganti."
 
 def _fmt_nik(p, bpjs):
     out = [f"🪪 *NIK Lookup*\n\n`{p['nik']}`\n"]
@@ -521,11 +599,8 @@ def _fmt_nik(p, bpjs):
         out.append(f"Provinsi: *{_esc(p['wilayah'].get('nama_provinsi','—'))}*")
         out.append(f"Kab/Kota: {_esc(p['wilayah'].get('nama_kabkota','—'))}")
         out.append(f"Kecamatan: {_esc(p['wilayah'].get('nama_kecamatan','—'))}")
-    elif not KODENIK_OK:
-        out.append("_kodenik tidak terinstal — wilayah tidak ditampilkan_")
     out.append(f"Tgl Lahir: *{p['tgl']} {p['bulan_nama']} {p['tahun']}*")
     out.append(f"JK: {p['jk']}")
-    out.append(f"No. Urut: {p['urut']}")
     if bpjs["status"] in ("aktif", "nonaktif"):
         icon = "✅" if bpjs["status"] == "aktif" else "🔴"
         out.append(f"\n{icon} *BPJS {bpjs['status'].capitalize()}*")
@@ -533,7 +608,6 @@ def _fmt_nik(p, bpjs):
             out.append(f"Nama: *{_esc(bpjs['nama'])}*")
     else:
         out.append("\n🟡 BPJS: tidak aktif / tidak ditemukan")
-    out.append("\n_⚠️ Bukan verifikasi Dukcapil — hanya parse struktur NIK + BPJS._")
     return "\n".join(out)
 
 # ================================================================== #
@@ -558,17 +632,21 @@ def run_bocor(uid, query, kind, bot_token, cfg=None):
             if kind == "email":
                 xon = xon_check_email(query)
                 ll = leaklookup_check(query, "email_address", cfg.get("leaklookup"))
-                lc = leakcheck_check(query)
-                text_out = _fmt_breach_list(query, merge_breach_names(xon, ll, lc))
+                lc = leakcheck_check(query, cfg.get("leakcheck_api"))
+                merged = merge_all_records(xon, ll, lc)
+                text_out = _fmt_records(query, merged)
             elif kind == "username":
                 xon = xon_check_email(query)
                 ll = leaklookup_check(query, "username", cfg.get("leaklookup"))
-                lc = leakcheck_check(query)
-                text_out = _fmt_breach_list(query, merge_breach_names(xon, ll, lc))
+                lc = leakcheck_check(query, cfg.get("leakcheck_api"))
+                merged = merge_all_records(xon, ll, lc)
+                text_out = _fmt_records(query, merged)
             elif kind == "phone":
                 phone = format_phone_id(query)
-                data = abstract_phone_check(phone, cfg.get("abstractapi"))
-                text_out = _fmt_phone(phone, data, bool(cfg.get("abstractapi")))
+                abs_data = abstract_phone_check(phone, cfg.get("abstractapi"))
+                lc = leakcheck_check(phone, cfg.get("leakcheck_api"))
+                merged = merge_all_records(None, None, lc)
+                text_out = _fmt_phone_combined(phone, abs_data, merged, bool(cfg.get("abstractapi")))
             elif kind == "nik":
                 p = parse_nik(query)
                 if not p:
