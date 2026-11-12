@@ -1845,7 +1845,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif state and state.startswith("bocor_await_"):
         kind = state.replace("bocor_await_", "")
         _user_state[uid] = None
-        cfg = {"leaklookup": LEAKLOOKUP_KEY, "abstractapi": ABSTRACTAPI_KEY}
+        cfg = {
+    "leaklookup": LEAKLOOKUP_KEY, 
+    "abstractapi": ABSTRACTAPI_KEY,
+    "leakcheck_api": LEAKCHECK_API_KEY
+        }
         threading.Thread(target=run_bocor,
                          args=(uid, text, kind, BOT_TOKEN, cfg), daemon=True).start()
 
