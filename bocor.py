@@ -327,7 +327,7 @@ def print_banner():
     for i, line in enumerate(lines):
         art.append(line + "\n", style=f"bold {COLORS[i % len(COLORS)]}")
     console.print(Align.center(art))
-    console.print(Align.center(Text("[ MR414N-ID | Data Breach Checker | v2.2 ]", style="bold cyan")))
+    console.print(Align.center(Text("[ MR414N-ID | Data Breach Checker | v2.3 ]", style="bold cyan")))
     console.print()
 
 def display_records(term, records):
@@ -524,32 +524,49 @@ def _esc(s):
 def _fmt_records(term, records):
     if not records:
         return f"✅ *Tidak ditemukan* untuk `{_esc(term)}`"
+    
     load_hibp_metadata()
     head = [f"⚠️ *{_esc(term)}* — *{len(records)} record* ditemukan:\n"]
     body = []
-    for r in records[:30]:
+    
+    # Limit 60 record, dipisah garis
+    for i, r in enumerate(records[:60]):
         src = r.get("source", "?")
         frm = r.get("from", "?")
         f = r.get("fields", {}) or {}
+        
+        if isinstance(src, dict):
+            src = src.get("name", "Unknown")
+            
         pw = f.get("password") or f.get("pass") or ""
         email = f.get("email") or f.get("mail") or ""
         user = f.get("username") or f.get("login") or ""
         ident = email or user or ""
+        
         line = f"🔸 *{_esc(src)}* _({frm})_"
         if ident:
             line += f"\n   👤 `{_esc(ident)}`"
         if pw:
             line += f"\n   🔑 `{_esc(pw)}`"
+            
         others = [k for k in f.keys() if k not in ("password","pass","email","mail","username","login")]
         if others:
             line += f"\n   📦 {_esc(', '.join(others[:5]))}"
+            
         body.append(line)
+        
+        if i < len(records[:60]) - 1:
+            body.append("---------------------------")
+            
     out = head + body
-    if len(records) > 30:
-        out.append(f"\n_...dan {len(records)-30} record lain_")
+    
+    if len(records) > 60:
+        out.append(f"\n\n_...dan {len(records)-60} record lain disembunyikan_")
+        
     pw_list = extract_passwords(records)
     if pw_list:
-        out.append(f"\n\n🔑 *{len(pw_list)} password unik ditemukan*")
+        out.append(f"\n\n🔑 *Total: {len(pw_list)} password unik ditemukan*")
+        
     return "\n".join(out)
 
 def _fmt_phone_combined(phone, abs_data, records, has_key):
