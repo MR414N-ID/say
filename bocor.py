@@ -135,9 +135,12 @@ def leakcheck_check(query, api_key=None):
                 for item in data.get("result", []):
                     src_obj = item.get("source", {})
                     src_name = src_obj.get("name", "Unknown") if isinstance(src_obj, dict) else str(src_obj)
+                    breach_date = src_obj.get("breach_date", "") if isinstance(src_obj, dict) else ""
                     
                     fields_data = {k: v for k, v in item.items() if k not in ("source", "fields")}
-                    
+                    if breach_date and "breach_date" not in fields_data:
+                        fields_data["_breach_date"] = breach_date
+                        
                     out.append({
                         "source": src_name,
                         "fields": fields_data
@@ -169,6 +172,20 @@ def hibp_password_check(password):
         return 0
     except Exception:
         return -1
+
+def auto_crack_md5(hash_str):
+    if len(hash_str) != 32: return None
+    try:
+        r = requests.get(f"https://md5decrypt.net/Api/api.php?hash={hash_str}&hash_type=md5&email=ryo.fake@email.com&code=9b8ba923b3f1c683", timeout=5)
+        if r.status_code == 200 and ":" not in r.text and len(r.text) < 50 and r.text.lower() != "invalid":
+            return r.text.strip()
+    except Exception:
+        pass
+    try:
+        r = requests.get(f"https://api.hashify.net/hash/md5/hex?value={hash_str}", timeout=5)
+    except Exception:
+        pass
+    return None
 
 def abstract_phone_check(phone, api_key):
     if not api_key:
@@ -327,7 +344,7 @@ def print_banner():
     for i, line in enumerate(lines):
         art.append(line + "\n", style=f"bold {COLORS[i % len(COLORS)]}")
     console.print(Align.center(art))
-    console.print(Align.center(Text("[ MR414N-ID | Data Breach Checker | v2.3 ]", style="bold cyan")))
+    console.print(Align.center(Text("[ MR414N-ID | Data Breach Checker | v2.4 ]", style="bold cyan")))
     console.print()
 
 def display_records(term, records):
@@ -361,7 +378,7 @@ def display_records(term, records):
         email = f.get("email") or f.get("mail") or ""
         user = f.get("username") or f.get("login") or ""
         ident = email or user or "—"
-        others = ", ".join(k for k in f.keys() if k not in ("password","pass","email","mail","username","login"))
+        others = ", ".join(k for k in f.keys() if k not in ("password","pass","email","mail","username","login","_breach_date"))
         pw_style = "bold red" if pw else "dim white"
         table.add_row(
             r.get("source","?"), r.get("from","?"), ident,
@@ -391,7 +408,15 @@ def cli_check_username(username, cfg):
 def cli_check_phone(phone, cfg):
     normalized = format_phone_id(phone)
     abs_data = abstract_phone_check(normalized, cfg.get("abstractapi"))
+    
+    # Fallback logic for phone in LeakCheck
     lc = leakcheck_check(normalized, cfg.get("leakcheck_api"))
+    if not lc:
+        lc = leakcheck_check("+" + normalized, cfg.get("leakcheck_api"))
+    if not lc:
+        lc_alt = normalized[2:] if normalized.startswith("62") else normalized
+        lc = leakcheck_check("0" + lc_alt, cfg.get("leakcheck_api"))
+
     merged = merge_all_records(None, None, lc)
     if RICH_OK:
         if abs_data:
@@ -529,7 +554,6 @@ def _fmt_records(term, records):
     head = [f"⚠️ *{_esc(term)}* — *{len(records)} record* ditemukan:\n"]
     body = []
     
-    # Limit 60 record, dipisah garis
     for i, r in enumerate(records[:60]):
         src = r.get("source", "?")
         frm = r.get("from", "?")
@@ -538,36 +562,66 @@ def _fmt_records(term, records):
         if isinstance(src, dict):
             src = src.get("name", "Unknown")
             
+        breach_date = f.get("_breach_date", "")
         pw = f.get("password") or f.get("pass") or ""
         email = f.get("email") or f.get("mail") or ""
         user = f.get("username") or f.get("login") or ""
-        ident = email or user or ""
+        name = f.get("name") or f.get("first_name") or ""
+        phone = f.get("phone") or ""
+        addr = f.get("address") or f.get("zip") or ""
+        origin = f.get("origin") or ""
         
-        line = f"🔸 *{_esc(src)}* _({frm})_"
-        if ident:
+        date_str = f" ({breach_date})" if breach_date else ""
+        line = f"🔸 *{_esc(src)}*{date_str} _({frm})_"
+        
+        if email or user:
+            ident = email if email else user
             line += f"\n   👤 `{_esc(ident)}`"
-        if pw:
-            line += f"\n   🔑 `{_esc(pw)}`"
             
-        others = [k for k in f.keys() if k not in ("password","pass","email","mail","username","login")]
-        if others:
-            line += f"\n   📦 {_esc(', '.join(others[:5]))}"
+        if pw:
+            is_hash = len(str(pw)) > 20 or (":" in str(pw) and len(str(pw).split(":")[0]) == 32)
+            if is_hash:
+                line += f"\n   🔒 Hash: `{_esc(pw)}`"
+            else:
+                line += f"\n   🔑 Pass: `{_esc(pw)}`"
+                
+        if origin:
+            line += f"\n   🌐 Asal: `{_esc(origin)}`"
+            
+        if name:
+            line += f"\n   📛 Nama: {_esc(name)}"
+        if addr:
+            line += f"\n   🏠 Alamat: {_esc(addr)}"
+        if phone:
+            line += f"\n   📱 HP: {_esc(phone)}"
             
         body.append(line)
         
         if i < len(records[:60]) - 1:
-            body.append("---------------------------")
+            body.append("------------")
             
-    out = head + body
+    out = head + [""]
+    out.append("========\n")
+    
+    # Grouping logic for separator
+    current_from = None
+    for b in body:
+        if b == "------------":
+            continue
+            
+        # Simplified: just use the lines and separators
+        out.append(b)
+    
+    out_str = "\n".join(out)
     
     if len(records) > 60:
-        out.append(f"\n\n_...dan {len(records)-60} record lain disembunyikan_")
+        out_str += f"\n\n_...dan {len(records)-60} record lain disembunyikan_"
         
     pw_list = extract_passwords(records)
     if pw_list:
-        out.append(f"\n\n🔑 *Total: {len(pw_list)} password unik ditemukan*")
+        out_str += f"\n\n🔑 *Total: {len(pw_list)} password unik ditemukan*"
         
-    return "\n".join(out)
+    return out_str
 
 def _fmt_phone_combined(phone, abs_data, records, has_key):
     out = [f"📱 *Phone Lookup* `+{_esc(phone)}`\n"]
@@ -585,8 +639,8 @@ def _fmt_phone_combined(phone, abs_data, records, has_key):
         out.append("_AbstractAPI key kosong — info jaringan di-skip_")
 
     if records:
-        out.append(f"\n\n💧 *{len(records)} record dari LeakCheck:*")
-        for r in records[:15]:
+        out.append(f"\n\n========\n💧 *{len(records)} record dari LeakCheck:*")
+        for i, r in enumerate(records[:15]):
             f = r.get("fields", {}) or {}
             pw = f.get("password") or f.get("pass") or ""
             email = f.get("email") or f.get("mail") or ""
@@ -598,6 +652,8 @@ def _fmt_phone_combined(phone, abs_data, records, has_key):
             if pw:
                 line += f"\n   🔑 `{_esc(pw)}`"
             out.append(line)
+            if i < len(records[:15]) - 1:
+                out.append("------------")
         if len(records) > 15:
             out.append(f"_...dan {len(records)-15} record lain_")
         pw_list = extract_passwords(records)
@@ -641,7 +697,7 @@ def run_bocor(uid, query, kind, bot_token, cfg=None):
     async def _run():
         bot = Bot(token=bot_token)
         label = {"email":"Email","username":"Username","phone":"Nomor HP",
-                 "nik":"NIK","password":"Password"}.get(kind, kind)
+                 "nik":"NIK","password":"Password","nama":"Nama"}.get(kind, kind)
         try:
             await bot.send_message(chat_id=uid,
                 text=f"⏳ Leak DB — {label}: `{query}`", parse_mode="Markdown")
@@ -662,10 +718,22 @@ def run_bocor(uid, query, kind, bot_token, cfg=None):
                 lc = leakcheck_check(query, cfg.get("leakcheck_api"))
                 merged = merge_all_records(xon, ll, lc)
                 text_out = _fmt_records(query, merged)
+            elif kind == "nama":
+                ll = leaklookup_check(query, "name", cfg.get("leaklookup"))
+                lc = leakcheck_check(query, cfg.get("leakcheck_api"))
+                merged = merge_all_records(None, ll, lc)
+                text_out = _fmt_records(query, merged)
             elif kind == "phone":
                 phone = format_phone_id(query)
                 abs_data = abstract_phone_check(phone, cfg.get("abstractapi"))
+                
                 lc = leakcheck_check(phone, cfg.get("leakcheck_api"))
+                if not lc:
+                    lc = leakcheck_check("+" + phone, cfg.get("leakcheck_api"))
+                if not lc:
+                    lc_alt = phone[2:] if phone.startswith("62") else phone
+                    lc = leakcheck_check("0" + lc_alt, cfg.get("leakcheck_api"))
+
                 merged = merge_all_records(None, None, lc)
                 text_out = _fmt_phone_combined(phone, abs_data, merged, bool(cfg.get("abstractapi")))
             elif kind == "nik":
